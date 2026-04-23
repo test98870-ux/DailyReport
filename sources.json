@@ -1,0 +1,121 @@
+[
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 종목분석",
+    "list_path": "company_list.naver",
+    "source_type": "증권사 리포트",
+    "include_item_name": true,
+    "limit": 4
+  },
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 시황정보",
+    "list_path": "market_info_list.naver",
+    "source_type": "증권사 리포트",
+    "limit": 4
+  },
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 산업분석",
+    "list_path": "industry_list.naver",
+    "source_type": "증권사 리포트",
+    "limit": 3
+  },
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 투자전략",
+    "list_path": "invest_list.naver",
+    "source_type": "증권사 리포트",
+    "limit": 3
+  },
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 경제분석",
+    "list_path": "economy_list.naver",
+    "source_type": "증권사 리포트",
+    "limit": 3
+  },
+  {
+    "type": "opendart",
+    "name": "OpenDART 오늘 공시",
+    "source_type": "공시",
+    "api_key_env": "OPENDART_API_KEY",
+    "corp_cls": "Y",
+    "days": 1,
+    "limit": 8
+  },
+  {
+    "type": "kind_rss",
+    "name": "KIND 오늘의 공시",
+    "source_type": "공시",
+    "market_type": 0,
+    "limit": 10
+  },
+  {
+    "type": "hankyung_consensus",
+    "name": "한경 컨센서스",
+    "source_type": "증권사 리포트",
+    "limit": 6
+  },
+  {
+    "type": "edgar_company",
+    "name": "SEC EDGAR AAPL",
+    "source_type": "미국 공시",
+    "cik": "0000320193",
+    "ticker": "AAPL",
+    "forms": ["10-K", "10-Q", "8-K"],
+    "limit": 3
+  },
+  {
+    "type": "naver_news_section",
+    "name": "네이버 뉴스 경제",
+    "source_type": "뉴스",
+    "section_id": "101",
+    "section_name": "경제",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "naver_news_section",
+    "name": "네이버 뉴스 사회",
+    "source_type": "뉴스",
+    "section_id": "102",
+    "section_name": "사회",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "naver_news_section",
+    "name": "네이버 뉴스 생활/문화",
+    "source_type": "뉴스",
+    "section_id": "103",
+    "section_name": "생활/문화",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "naver_news_section",
+    "name": "네이버 뉴스 세계",
+    "source_type": "뉴스",
+    "section_id": "104",
+    "section_name": "세계",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "naver_news_section",
+    "name": "네이버 뉴스 IT/과학",
+    "source_type": "뉴스",
+    "section_id": "105",
+    "section_name": "IT/과학",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "clien_news",
+    "name": "클리앙 새로운소식",
+    "source_type": "뉴스",
+    "limit": 0,
+    "hours": 24
+  }
+]
