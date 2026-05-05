@@ -5,7 +5,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from typing import Iterable
@@ -17,6 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SAMPLE_FILE = BASE_DIR / "data" / "sample_items.json"
 DEFAULT_CONFIG_FILE = BASE_DIR / "sources.json"
 KST = timezone(timedelta(hours=9))
+NEWS_COLLECTION_START_HOUR = 16
 NAVER_FINANCE_BASE = "https://finance.naver.com/research/"
 NAVER_ROOT = "https://finance.naver.com/"
 DART_LIST_API = "https://opendart.fss.or.kr/api/list.json"
@@ -121,6 +122,30 @@ def within_last_hours(published_at: str, hours: int) -> bool:
         return False
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     return published.astimezone(timezone.utc) >= cutoff
+
+
+def news_collection_window_start(now: datetime | None = None) -> datetime:
+    now_kst = (now or datetime.now(KST)).astimezone(KST)
+    start_date = now_kst.date() - timedelta(days=1)
+    return datetime.combine(start_date, time(hour=NEWS_COLLECTION_START_HOUR), tzinfo=KST)
+
+
+def within_news_collection_window(published_at: str, now: datetime | None = None) -> bool:
+    try:
+        published = datetime.fromisoformat(published_at).astimezone(timezone.utc)
+    except ValueError:
+        return False
+    now_utc = (now or datetime.now(KST)).astimezone(timezone.utc)
+    start_utc = news_collection_window_start(now).astimezone(timezone.utc)
+    return start_utc <= published <= now_utc
+
+
+def before_news_collection_window(published_at: str, now: datetime | None = None) -> bool:
+    try:
+        published = datetime.fromisoformat(published_at).astimezone(timezone.utc)
+    except ValueError:
+        return False
+    return published < news_collection_window_start(now).astimezone(timezone.utc)
 
 
 def first_external_link(html_fragment: str, blocked_hosts: set[str]) -> str:
@@ -228,6 +253,8 @@ class KindRssSource(Source):
             )
             if not title:
                 continue
+            if not within_last_hours(published, 24):
+                break
             parts = [
                 f"회사: {author or '미기재'}",
                 f"분류: {category or '미기재'}",
@@ -335,13 +362,16 @@ class OpenDartSource(Source):
             ]
             if row.get("rm"):
                 pieces.append(f"비고: {row['rm']}")
+            published_at = datetime.strptime(row["rcept_dt"], "%Y%m%d").replace(tzinfo=KST).isoformat()
+            if not within_last_hours(published_at, 24):
+                continue
             items.append(
                 SourceItem(
                     source_type=self.source_type,
                     source_name=self.name,
                     title=f"{row.get('corp_name', '기업')} - {row.get('report_nm', '공시')}",
                     url=viewer_url,
-                    published_at=datetime.strptime(row["rcept_dt"], "%Y%m%d").replace(tzinfo=KST).isoformat(),
+                    published_at=published_at,
                     content="\n".join(pieces),
                     tags=[value for value in [row.get("stock_code"), row.get("corp_cls")] if value],
                 )
@@ -378,6 +408,9 @@ class NaverResearchSource(Source):
             published_at_raw = self._extract_published_date(row_html)
             if not title or not broker or not published_at_raw:
                 continue
+            published_at = parse_naver_date(published_at_raw)
+            if not within_last_hours(published_at, 24):
+                break
             item_name = self._extract_item_name(row_html)
             detail_url = urljoin(NAVER_FINANCE_BASE, detail_path)
             pdf_url = self._extract_pdf_url(row_html)
@@ -399,7 +432,7 @@ class NaverResearchSource(Source):
                     source_name=self.name,
                     title=display_title,
                     url=pdf_url or detail_url,
-                    published_at=parse_naver_date(published_at_raw),
+                    published_at=published_at,
                     content=content,
                     tags=tags,
                 )
@@ -489,6 +522,9 @@ class HankyungConsensusSource(Source):
             broker = strip_tags(cells[4])
             if not date_text or not link_match or not title:
                 continue
+            published_at = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=KST).isoformat()
+            if not within_last_hours(published_at, 24):
+                break
             summary_match = re.search(r'<div id="content_\d+" class="pop01 disNone">(.*?)</div>', cells[2], flags=re.S)
             summary = strip_tags(summary_match.group(1)) if summary_match else ""
             content_parts = [
@@ -505,7 +541,7 @@ class HankyungConsensusSource(Source):
                     source_name=self.name,
                     title=title,
                     url=urljoin(HANKYUNG_BASE, html.unescape(link_match.group(1))),
-                    published_at=datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=KST).isoformat(),
+                    published_at=published_at,
                     content="\n".join(content_parts),
                     tags=[value for value in [category, broker, analyst] if value],
                 )
@@ -543,6 +579,9 @@ class WiseReportSource(Source):
             title = strip_tags(re.sub(r'<span class="r_pre">\[[^\]]+\]</span>', "", anchor_html)).strip()
             if not title:
                 continue
+            published_at = parse_slash_date(date_match.group(1))
+            if not within_last_hours(published_at, 24):
+                break
             rpt_id, broker_code, pdf_name = report_match.groups()
             url = (
                 f"{WISEREPORT_BASE}/comm/LoadReport.aspx?"
@@ -561,7 +600,7 @@ class WiseReportSource(Source):
                     source_name=self.name,
                     title=title,
                     url=url,
-                    published_at=parse_slash_date(date_match.group(1)),
+                    published_at=published_at,
                     content="\n".join(content_parts),
                     tags=[value for value in [category, "WiseReport", "FnGuide"] if value],
                 )
@@ -615,6 +654,9 @@ class EdgarCompanySource(Source):
             primary_document = primary_documents[index]
             primary_description = primary_descriptions[index]
             detail_url = f"{SEC_ARCHIVES_BASE}{cik_numeric}/{accession_slug}/{accession}-index.htm"
+            published_at = datetime.strptime(filing_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).isoformat()
+            if not within_last_hours(published_at, 24):
+                break
             description_bits = [
                 f"회사명: {company_name}",
                 f"티커: {ticker or '미기재'}",
@@ -629,7 +671,7 @@ class EdgarCompanySource(Source):
                     source_name=self.name,
                     title=f"{company_name} {form}",
                     url=detail_url,
-                    published_at=datetime.strptime(filing_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).isoformat(),
+                    published_at=published_at,
                     content="\n".join(description_bits),
                     tags=[value for value in [ticker, form] if value],
                 )
@@ -681,8 +723,10 @@ class NaverNewsSectionSource(Source):
             item = self._fetch_article(link, title)
             if item is None:
                 continue
-            if not within_last_hours(item.published_at, self.hours):
-                break
+            if not within_news_collection_window(item.published_at):
+                if before_news_collection_window(item.published_at):
+                    break
+                continue
             items.append(item)
             if self.limit > 0 and len(items) >= self.limit:
                 break
@@ -744,8 +788,10 @@ class ClienNewsSource(Source):
         items: list[SourceItem] = []
         for href, title, author, timestamp in matches:
             published_at = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).isoformat()
-            if not within_last_hours(published_at, self.hours):
-                break
+            if not within_news_collection_window(published_at):
+                if before_news_collection_window(published_at):
+                    break
+                continue
             detail_url = urljoin("https://www.clien.net", href.split("?", 1)[0])
             items.append(self._fetch_detail(detail_url, title, author, published_at))
             if self.limit > 0 and len(items) >= self.limit:

@@ -44,6 +44,12 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
 
 
+def clear_items() -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM items")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'items'")
+
+
 def upsert_item(
     *,
     source_type: str,
@@ -71,7 +77,11 @@ def upsert_item(
         )
 
 
-def fetch_recent_items(limit: int = 300, within_hours: int | None = 24) -> list[sqlite3.Row]:
+def fetch_recent_items(
+    limit: int = 300,
+    within_hours: int | None = 24,
+    since: datetime | None = None,
+) -> list[sqlite3.Row]:
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -80,10 +90,10 @@ def fetch_recent_items(limit: int = 300, within_hours: int | None = 24) -> list[
             ORDER BY published_at DESC, id DESC
             """,
         ).fetchall()
-    if within_hours is None:
+    if since is None and within_hours is None:
         return rows[:limit]
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=within_hours)
+    cutoff = since.astimezone(timezone.utc) if since is not None else datetime.now(timezone.utc) - timedelta(hours=within_hours)
     filtered: list[sqlite3.Row] = []
     for row in rows:
         try:

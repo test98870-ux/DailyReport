@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from pypdf import PdfReader
 
-from db import init_db, upsert_item
+from db import clear_items, init_db, upsert_item
 from sources import SourceItem, build_sources
 
 
@@ -34,6 +34,7 @@ ProgressCallback = Callable[[dict[str, object]], None]
 
 def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineResult:
     init_db()
+    clear_items()
     errors: list[str] = []
     stored = 0
     items: list[SourceItem] = []
