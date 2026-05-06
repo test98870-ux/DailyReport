@@ -481,6 +481,7 @@ button:hover {
 
 .card {
   position: relative;
+  min-width: 0;
 }
 
 .card.is-report {
@@ -501,6 +502,7 @@ button:hover {
   gap: 8px;
   align-items: center;
   margin-bottom: 16px;
+  min-width: 0;
 }
 
 .pill {
@@ -556,14 +558,18 @@ h3 a:hover {
 
 .meta-actions {
   display: inline-flex;
-  flex-shrink: 0;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   margin-left: auto;
+  min-width: 0;
 }
 
 .item-hide-button,
 .item-nav-button {
-  min-width: 64px;
+  flex: 0 1 64px;
+  min-width: 0;
   padding: 8px 12px;
   font-size: 13px;
 }

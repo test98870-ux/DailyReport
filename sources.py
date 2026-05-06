@@ -18,6 +18,7 @@ DEFAULT_SAMPLE_FILE = BASE_DIR / "data" / "sample_items.json"
 DEFAULT_CONFIG_FILE = BASE_DIR / "sources.json"
 KST = timezone(timedelta(hours=9))
 NEWS_COLLECTION_START_HOUR = 16
+DEFAULT_COLLECTION_DAYS = 1
 NAVER_FINANCE_BASE = "https://finance.naver.com/research/"
 NAVER_ROOT = "https://finance.naver.com/"
 DART_LIST_API = "https://opendart.fss.or.kr/api/list.json"
@@ -120,13 +121,21 @@ def within_last_hours(published_at: str, hours: int) -> bool:
         published = datetime.fromisoformat(published_at)
     except ValueError:
         return False
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(hours, collection_window_days() * 24))
     return published.astimezone(timezone.utc) >= cutoff
+
+
+def collection_window_days() -> int:
+    raw_days = os.getenv("DAILY_REPORT_COLLECTION_DAYS", str(DEFAULT_COLLECTION_DAYS))
+    try:
+        return max(1, int(raw_days))
+    except ValueError:
+        return DEFAULT_COLLECTION_DAYS
 
 
 def news_collection_window_start(now: datetime | None = None) -> datetime:
     now_kst = (now or datetime.now(KST)).astimezone(KST)
-    start_date = now_kst.date() - timedelta(days=1)
+    start_date = now_kst.date() - timedelta(days=collection_window_days())
     return datetime.combine(start_date, time(hour=NEWS_COLLECTION_START_HOUR), tzinfo=KST)
 
 

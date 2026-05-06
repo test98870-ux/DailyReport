@@ -122,6 +122,7 @@ def render_dashboard() -> str:
       let newsRotationTimer = null;
       let slideshowTimer = null;
       let slideshowEnabled = false;
+      let slideshowWakeLock = null;
       let slideshowIndex = 0;
       let newsCategoryCycleIndex = 0;
       const newsCategoryOffsets = {};
@@ -350,9 +351,9 @@ def render_dashboard() -> str:
         cards.forEach((candidate) => {
           const active = candidate === target;
           candidate.classList.toggle("is-navigation-current", active);
-          candidate.classList.toggle("is-navigation-hidden", !active);
           candidate.classList.toggle("is-navigation-focus", active);
         });
+        target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
         window.setTimeout(() => target.classList.remove("is-navigation-focus"), 900);
         updateCategoryBlocks();
       }
@@ -455,12 +456,48 @@ def render_dashboard() -> str:
         slideshowToggleButton.setAttribute("aria-pressed", String(slideshowEnabled));
       }
 
+      async function requestSlideshowWakeLock() {
+        if (!("wakeLock" in navigator) || document.visibilityState !== "visible" || slideshowWakeLock) {
+          return;
+        }
+        try {
+          slideshowWakeLock = await navigator.wakeLock.request("screen");
+          slideshowWakeLock.addEventListener("release", () => {
+            slideshowWakeLock = null;
+          });
+        } catch (_error) {
+          slideshowWakeLock = null;
+        }
+      }
+
+      async function releaseSlideshowWakeLock() {
+        if (!slideshowWakeLock) {
+          return;
+        }
+        const lock = slideshowWakeLock;
+        slideshowWakeLock = null;
+        try {
+          await lock.release();
+        } catch (_error) {
+          slideshowWakeLock = null;
+        }
+      }
+
+      function syncSlideshowWakeLock() {
+        if (slideshowEnabled) {
+          requestSlideshowWakeLock();
+        } else {
+          releaseSlideshowWakeLock();
+        }
+      }
+
       function refreshSlideshow() {
         if (slideshowEnabled) {
           clearNewsNavigation();
         }
         clearSlideshow();
         syncSlideshowButton();
+        syncSlideshowWakeLock();
         renderSlideshowFrame();
         if (!slideshowEnabled) {
           return;
@@ -567,25 +604,42 @@ def render_dashboard() -> str:
         });
       });
 
-      itemCards.forEach((card) => {
-        const button = card.querySelector(".item-hide-button");
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          syncSlideshowWakeLock();
+        }
+      });
+
+      document.addEventListener("click", (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+        const button = event.target.closest(".item-hide-button, .item-nav-button, #slideshow-toggle");
         if (!button) {
           return;
         }
-        button.addEventListener("click", () => hideItem(card));
-      });
+        event.preventDefault();
+        button.blur();
 
-      itemCards.forEach((card) => {
-        card.querySelectorAll(".item-nav-button").forEach((button) => {
-          button.addEventListener("click", () => navigateNewsCard(card, button.dataset.itemNav || button.dataset.newsNav));
-        });
-      });
+        if (button.id === "slideshow-toggle") {
+          slideshowEnabled = !slideshowEnabled;
+          slideshowIndex = 0;
+          newsCategoryCycleIndex = 0;
+          refreshSlideshow();
+          return;
+        }
 
-      slideshowToggleButton.addEventListener("click", () => {
-        slideshowEnabled = !slideshowEnabled;
-        slideshowIndex = 0;
-        newsCategoryCycleIndex = 0;
-        refreshSlideshow();
+        const card = button.closest("[data-item-key]");
+        if (!card) {
+          return;
+        }
+        if (button.classList.contains("item-hide-button")) {
+          hideItem(card);
+          return;
+        }
+        if (button.classList.contains("item-nav-button")) {
+          navigateNewsCard(card, button.dataset.itemNav || button.dataset.newsNav);
+        }
       });
 
       renderItemVisibility();

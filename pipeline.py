@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import os
 from io import BytesIO
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -215,6 +216,8 @@ def emit_progress(progress_callback: ProgressCallback | None, payload: dict[str,
 
 
 def codex_available() -> bool:
+    if os.getenv("DAILY_REPORT_SUMMARY_MODE", "").strip().lower() == "fallback":
+        return False
     return shutil.which("codex") is not None
 
 
