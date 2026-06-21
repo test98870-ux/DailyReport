@@ -67,47 +67,110 @@
     "limit": 3
   },
   {
-    "type": "naver_news_section",
-    "name": "네이버 뉴스 경제",
+    "type": "daum_news_section",
+    "name": "다음 뉴스 지방선거 새로운소식",
     "source_type": "뉴스",
-    "section_id": "101",
-    "section_name": "경제",
+    "section_url": "https://issue.daum.net/election/2026",
+    "section_name": "지방선거 새로운소식",
     "limit": 0,
     "hours": 24
   },
   {
-    "type": "naver_news_section",
-    "name": "네이버 뉴스 사회",
+    "type": "daum_news_section",
+    "name": "다음 뉴스 기후/환경",
     "source_type": "뉴스",
-    "section_id": "102",
+    "section_path": "news/climate",
+    "section_name": "기후/환경",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 사회",
+    "source_type": "뉴스",
+    "section_path": "news/society",
     "section_name": "사회",
     "limit": 0,
     "hours": 24
   },
   {
-    "type": "naver_news_section",
-    "name": "네이버 뉴스 생활/문화",
+    "type": "daum_news_section",
+    "name": "다음 뉴스 경제",
     "source_type": "뉴스",
-    "section_id": "103",
-    "section_name": "생활/문화",
+    "section_path": "news/economy",
+    "section_name": "경제",
     "limit": 0,
     "hours": 24
   },
   {
-    "type": "naver_news_section",
-    "name": "네이버 뉴스 세계",
+    "type": "daum_news_section",
+    "name": "다음 뉴스 정치",
     "source_type": "뉴스",
-    "section_id": "104",
-    "section_name": "세계",
+    "section_path": "news/politics",
+    "section_name": "정치",
     "limit": 0,
     "hours": 24
   },
   {
-    "type": "naver_news_section",
-    "name": "네이버 뉴스 IT/과학",
+    "type": "daum_news_section",
+    "name": "다음 뉴스 국제",
     "source_type": "뉴스",
-    "section_id": "105",
+    "section_path": "news/world",
+    "section_name": "국제",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 문화",
+    "source_type": "뉴스",
+    "section_path": "news/culture",
+    "section_name": "문화",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 생활",
+    "source_type": "뉴스",
+    "section_path": "news/life",
+    "section_name": "생활",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 IT/과학",
+    "source_type": "뉴스",
+    "section_path": "news/tech",
     "section_name": "IT/과학",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 인물",
+    "source_type": "뉴스",
+    "section_path": "news/people",
+    "section_name": "인물",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 지식/칼럼",
+    "source_type": "뉴스",
+    "section_path": "news/understanding",
+    "section_name": "지식/칼럼",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
+    "name": "다음 뉴스 연재",
+    "source_type": "뉴스",
+    "section_path": "news/series",
+    "section_name": "연재",
     "limit": 0,
     "hours": 24
   },

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from typing import Iterable
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
@@ -29,6 +30,7 @@ SEC_SUBMISSIONS_BASE = "https://data.sec.gov/submissions/"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data/"
 KIND_RSS_URL = "http://kind.krx.co.kr/disclosure/rsstodaydistribute.do?method=searchRssTodayDistribute"
 NAVER_NEWS_BASE = "https://news.naver.com"
+DAUM_NEWS_BASE = "https://news.daum.net"
 CLIEN_NEWS_URL = "https://www.clien.net/service/board/news"
 DAMOANG_NEWS_URL = "https://damoang.net/new"
 
@@ -44,6 +46,10 @@ class SourceItem:
     tags: list[str]
 
 
+def title_only_content(*parts: str) -> str:
+    return " | ".join(part.strip() for part in parts if part and part.strip())
+
+
 class Source:
     def fetch(self) -> list[SourceItem]:
         raise NotImplementedError
@@ -55,7 +61,10 @@ def fetch_text(url: str, encoding: str | None = None, headers: dict[str, str] | 
         request_headers.update(headers)
     request = Request(url, headers=request_headers)
     with urlopen(request, timeout=20) as response:
-        body = response.read()
+        try:
+            body = response.read()
+        except http.client.IncompleteRead as exc:
+            body = exc.partial
         detected = encoding or response.headers.get_content_charset() or "utf-8"
     try:
         return body.decode(detected, errors="replace")
@@ -86,6 +95,13 @@ def parse_slash_date(raw: str) -> str:
     return datetime(int(f"20{year}"), int(month), int(day), tzinfo=KST).isoformat()
 
 
+def parse_daum_article_datetime(article_url: str) -> str:
+    match = re.search(r"/v/(\d{14})", article_url)
+    if not match:
+        return ""
+    return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=KST).isoformat()
+
+
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -104,6 +120,10 @@ def normalize_news_url(url: str) -> str:
         aid = query.get("aid", [""])[0]
         if oid and aid:
             return f"naver:{oid}:{aid}"
+    if "v.daum.net" in host:
+        match = re.search(r"/v/(\d+)", path)
+        if match:
+            return f"daum:{match.group(1)}"
     filtered_query = "&".join(
         f"{key}={value}"
         for key, values in sorted(parse_qs(parsed.query).items())
@@ -155,18 +175,6 @@ def before_news_collection_window(published_at: str, now: datetime | None = None
     except ValueError:
         return False
     return published < news_collection_window_start(now).astimezone(timezone.utc)
-
-
-def first_external_link(html_fragment: str, blocked_hosts: set[str]) -> str:
-    for match in re.finditer(r"""(?:href|ori-url)=['\"]([^'\"]+)['\"]""", html_fragment):
-        url = html.unescape(match.group(1)).strip()
-        if not url.startswith("http"):
-            continue
-        host = urlparse(url).netloc.lower().replace("www.", "")
-        if host in blocked_hosts:
-            continue
-        return url
-    return ""
 
 
 class SampleFileSource(Source):
@@ -264,14 +272,6 @@ class KindRssSource(Source):
                 continue
             if not within_last_hours(published, 24):
                 break
-            parts = [
-                f"회사: {author or '미기재'}",
-                f"분류: {category or '미기재'}",
-                f"제목: {title}",
-            ]
-            detail_text = fetch_kind_detail_text(link)
-            if detail_text:
-                parts.append(detail_text)
             items.append(
                 SourceItem(
                     source_type=self.source_type,
@@ -279,7 +279,7 @@ class KindRssSource(Source):
                     title=title,
                     url=link,
                     published_at=published,
-                    content="\n".join(parts),
+                    content=title_only_content(author, category, title),
                     tags=[value for value in [author, category] if value],
                 )
             )
@@ -293,30 +293,6 @@ def normalize_kind_url(url: str) -> str:
         .replace("http://kind.krx.co.kr/", "https://kind.krx.co.kr/")
         .replace("https://kind.krx.co.kr:80/", "https://kind.krx.co.kr/")
     )
-
-
-def fetch_kind_detail_text(viewer_url: str) -> str:
-    if not viewer_url:
-        return ""
-    viewer_html = fetch_text(viewer_url, encoding="utf-8")
-    match = re.search(r"parent\.setPath\('([^']*)','([^']*)','([^']*)'", viewer_html)
-    if not match:
-        doc_match = re.search(r"<option value='(\d+)\|Y'selected=\"selected\">", viewer_html)
-        if doc_match:
-            contents_html = fetch_text(
-                f"https://kind.krx.co.kr/common/disclsviewer.do?method=searchContents&docNo={doc_match.group(1)}",
-                encoding="utf-8",
-            )
-            match = re.search(r"parent\.setPath\('([^']*)','([^']*)','([^']*)'", contents_html)
-    if not match:
-        return ""
-    doc_url = normalize_kind_url(match.group(2))
-    detail_html = fetch_text(doc_url, encoding="utf-8")
-    body_match = re.search(r"<body[^>]*>(.*)</body>", detail_html, flags=re.S | re.I)
-    body_html = body_match.group(1) if body_match else detail_html
-    text = strip_tags(body_html)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    return text[:6000]
 
 
 class OpenDartSource(Source):
@@ -423,14 +399,6 @@ class NaverResearchSource(Source):
             item_name = self._extract_item_name(row_html)
             detail_url = urljoin(NAVER_FINANCE_BASE, detail_path)
             pdf_url = self._extract_pdf_url(row_html)
-            content = self._fetch_detail_content(detail_url)
-            if not content:
-                parts = [title, broker]
-                if item_name:
-                    parts.insert(0, item_name)
-                if pdf_url:
-                    parts.append(f"PDF: {pdf_url}")
-                content = " | ".join(parts)
             display_title = f"{item_name}: {title}" if item_name and self.include_item_name else title
             tags = [broker]
             if item_name:
@@ -442,7 +410,7 @@ class NaverResearchSource(Source):
                     title=display_title,
                     url=pdf_url or detail_url,
                     published_at=published_at,
-                    content=content,
+                    content=title_only_content(item_name, title, broker),
                     tags=tags,
                 )
             )
@@ -479,16 +447,6 @@ class NaverResearchSource(Source):
     def _extract_published_date(self, row_html: str) -> str:
         match = re.search(r'<td class="date"[^>]*>(\d{2}\.\d{2}\.\d{2})</td>', row_html)
         return match.group(1) if match else ""
-
-    def _fetch_detail_content(self, detail_url: str) -> str:
-        detail_html = fetch_text(detail_url, encoding="euc-kr")
-        match = re.search(
-            r'<td colspan="2" class="view_cnt">\s*<div[^>]*>(.*?)</div>',
-            detail_html,
-            flags=re.S,
-        )
-        return strip_tags(match.group(1)) if match else ""
-
 
 class HankyungConsensusSource(Source):
     def __init__(
@@ -534,16 +492,6 @@ class HankyungConsensusSource(Source):
             published_at = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=KST).isoformat()
             if not within_last_hours(published_at, 24):
                 break
-            summary_match = re.search(r'<div id="content_\d+" class="pop01 disNone">(.*?)</div>', cells[2], flags=re.S)
-            summary = strip_tags(summary_match.group(1)) if summary_match else ""
-            content_parts = [
-                f"분류: {category}",
-                f"증권사: {broker}",
-            ]
-            if analyst:
-                content_parts.append(f"애널리스트: {analyst}")
-            if summary:
-                content_parts.append(summary)
             items.append(
                 SourceItem(
                     source_type=self.source_type,
@@ -551,7 +499,7 @@ class HankyungConsensusSource(Source):
                     title=title,
                     url=urljoin(HANKYUNG_BASE, html.unescape(link_match.group(1))),
                     published_at=published_at,
-                    content="\n".join(content_parts),
+                    content=title_only_content(category, broker, analyst, title),
                     tags=[value for value in [category, broker, analyst] if value],
                 )
             )
@@ -596,13 +544,6 @@ class WiseReportSource(Source):
                 f"{WISEREPORT_BASE}/comm/LoadReport.aspx?"
                 f"rpt_id={rpt_id}&brk_cd={broker_code}&fpath={pdf_name}&view_lang=K"
             )
-            content_parts = [
-                "출처: WiseReport / FnGuide",
-                f"분류: {category or '미분류'}",
-                f"리포트ID: {rpt_id}",
-                f"브로커코드: {broker_code}",
-                f"원문파일: {pdf_name}",
-            ]
             items.append(
                 SourceItem(
                     source_type=self.source_type,
@@ -610,7 +551,7 @@ class WiseReportSource(Source):
                     title=title,
                     url=url,
                     published_at=published_at,
-                    content="\n".join(content_parts),
+                    content=title_only_content(category, title, pdf_name),
                     tags=[value for value in [category, "WiseReport", "FnGuide"] if value],
                 )
             )
@@ -732,7 +673,7 @@ class NaverNewsSectionSource(Source):
             item = self._fetch_article(link, title)
             if item is None:
                 continue
-            if not within_news_collection_window(item.published_at):
+            if not within_news_collection_window(published_at):
                 if before_news_collection_window(item.published_at):
                     break
                 continue
@@ -755,26 +696,94 @@ class NaverNewsSectionSource(Source):
             flags=re.S,
         )
         press_name = html.unescape(press_match.group(1)).strip() if press_match else self.name
-        body_match = re.search(r'<article id="dic_area"[^>]*>(.*?)</article>', html_text, flags=re.S)
-        article_text = strip_tags(body_match.group(1)) if body_match else ""
-        if not article_text:
-            description_match = re.search(r'<meta name="description" content="([^"]+)"', html_text)
-            article_text = html.unescape(description_match.group(1)).strip() if description_match else ""
-        article_text = article_text[:6000]
-        content_parts = [
-            f"섹션: {self.section_name}",
-            f"언론사: {press_name}",
-            article_text,
-        ]
         return SourceItem(
             source_type=self.source_type,
             source_name=self.name,
             title=title,
             url=article_url,
             published_at=published_at,
-            content="\n".join(part for part in content_parts if part),
+            content=title_only_content(self.section_name, press_name, title),
             tags=[value for value in [self.section_name, press_name] if value],
         )
+
+
+class DaumNewsSectionSource(Source):
+    def __init__(
+        self,
+        *,
+        name: str,
+        section_name: str,
+        section_path: str = "",
+        section_url: str = "",
+        source_type: str = "뉴스",
+        limit: int = 0,
+        hours: int = 24,
+    ) -> None:
+        self.name = name
+        self.section_path = section_path.strip("/")
+        self.section_url = section_url.strip()
+        self.section_name = section_name
+        self.source_type = source_type
+        self.limit = limit
+        self.hours = hours
+
+    def fetch(self) -> list[SourceItem]:
+        section_url = self.section_url or urljoin(f"{DAUM_NEWS_BASE}/", self.section_path)
+        html_text = fetch_text(
+            section_url,
+            encoding="utf-8",
+            headers={"Referer": DAUM_NEWS_BASE, "User-Agent": "Mozilla/5.0 DailyReportBot/1.0"},
+        )
+        matches = re.findall(
+            r'<a[^>]+href="(https://v\.daum\.net/v/\d+)"[^>]*>(.*?)</a>',
+            html_text,
+            flags=re.S,
+        )
+        items: list[SourceItem] = []
+        seen_urls: set[str] = set()
+        for link, anchor_html in matches:
+            normalized_url = normalize_news_url(link)
+            if normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            title = self._extract_listing_title(anchor_html)
+            published_at = parse_daum_article_datetime(link)
+            if not title or not published_at:
+                continue
+            if not within_news_collection_window(published_at):
+                if before_news_collection_window(published_at):
+                    break
+                continue
+            press_name = self._extract_listing_press(anchor_html)
+            item = SourceItem(
+                source_type=self.source_type,
+                source_name=self.name,
+                title=title,
+                url=link,
+                published_at=published_at,
+                content=title_only_content(self.section_name, press_name, title),
+                tags=[value for value in [self.section_name, press_name] if value],
+            )
+            items.append(item)
+            if self.limit > 0 and len(items) >= self.limit:
+                break
+        return items
+
+    def _extract_listing_title(self, anchor_html: str) -> str:
+        title_match = re.search(r'<strong[^>]+class="[^"]*tit_txt[^"]*"[^>]*>(.*?)</strong>', anchor_html, flags=re.S)
+        if title_match:
+            return strip_tags(title_match.group(1))
+        data_title_match = re.search(r'data-title="([^"]+)"', anchor_html)
+        if data_title_match:
+            return html.unescape(unquote(data_title_match.group(1))).strip()
+        return ""
+
+    def _extract_listing_press(self, anchor_html: str) -> str:
+        infos = [strip_tags(value) for value in re.findall(r'<span class="txt_info">(.*?)</span>', anchor_html, flags=re.S)]
+        for value in infos:
+            if value and not value.endswith("전"):
+                return value
+        return self.name
 
 
 class ClienNewsSource(Source):
@@ -802,40 +811,20 @@ class ClienNewsSource(Source):
                     break
                 continue
             detail_url = urljoin("https://www.clien.net", href.split("?", 1)[0])
-            items.append(self._fetch_detail(detail_url, title, author, published_at))
+            items.append(
+                SourceItem(
+                    source_type=self.source_type,
+                    source_name=self.name,
+                    title=html.unescape(title).strip(),
+                    url=detail_url,
+                    published_at=published_at,
+                    content=title_only_content("클리앙", author, title),
+                    tags=[value for value in ["클리앙", author] if value],
+                )
+            )
             if self.limit > 0 and len(items) >= self.limit:
                 break
         return items
-
-    def _fetch_detail(self, detail_url: str, title: str, author: str, published_at: str) -> SourceItem:
-        html_text = fetch_text(detail_url, encoding="utf-8", headers={"Referer": CLIEN_NEWS_URL})
-        body_match = re.search(r'<div class="post_article"\s*>(.*?)</article>', html_text, flags=re.S)
-        body_html = body_match.group(1) if body_match else ""
-        body_text = strip_tags(body_html)[:6000]
-        original_link = ""
-        source_link_match = re.search(r"<strong>출처 : </strong></span><a href='([^']+)'", html_text)
-        if source_link_match:
-            original_link = html.unescape(source_link_match.group(1)).strip()
-        if not original_link:
-            original_link = first_external_link(body_html, {"clien.net"})
-        content_parts = [
-            "커뮤니티: 클리앙 새로운소식",
-            f"작성자: {author}",
-            f"게시글: {detail_url}",
-        ]
-        if original_link:
-            content_parts.append(f"원문: {original_link}")
-        if body_text:
-            content_parts.append(body_text)
-        return SourceItem(
-            source_type=self.source_type,
-            source_name=self.name,
-            title=html.unescape(title).strip(),
-            url=original_link or detail_url,
-            published_at=published_at,
-            content="\n".join(content_parts),
-            tags=[value for value in ["클리앙", author] if value],
-        )
 
 
 class DamoangNewsSource(Source):
@@ -914,6 +903,16 @@ def build_sources() -> Iterable[Source]:
                 yield NaverNewsSectionSource(
                     name=row["name"],
                     section_id=str(row["section_id"]),
+                    section_name=row["section_name"],
+                    source_type=row.get("source_type", "뉴스"),
+                    limit=int(row.get("limit", 10)),
+                    hours=int(row.get("hours", 24)),
+                )
+            if row["type"] == "daum_news_section":
+                yield DaumNewsSectionSource(
+                    name=row["name"],
+                    section_path=row.get("section_path", ""),
+                    section_url=row.get("section_url", ""),
                     section_name=row["section_name"],
                     source_type=row.get("source_type", "뉴스"),
                     limit=int(row.get("limit", 10)),

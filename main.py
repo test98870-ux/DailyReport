@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,12 +91,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def render_dashboard() -> str:
-    rows = fetch_recent_items(since=news_collection_window_start())
-    reports = [dict(row) for row in rows if is_report(dict(row))]
-    disclosures = [dict(row) for row in rows if is_disclosure(dict(row))]
-    news_items = [dict(row) for row in rows if is_news(dict(row))]
+    rows = sort_items_by_published_desc([dict(row) for row in fetch_recent_items(since=news_collection_window_start())])
+    reports = sort_items_by_published_desc([row for row in rows if is_report(row)])
+    disclosures = sort_items_by_published_desc([row for row in rows if is_disclosure(row)])
+    news_items = sort_items_by_published_desc([row for row in rows if is_news(row)])
     spotlight_cards = render_spotlight_section(reports, disclosures, news_items)
-    all_cards = "\n".join(render_card(dict(row)) for row in rows) or render_empty("어제 16시 이후 자료가 아직 없습니다.")
+    all_cards = "\n".join(render_card(row) for row in rows) or render_empty("어제 16시 이후 자료가 아직 없습니다.")
     report_cards = render_report_sections(reports)
     disclosure_cards = render_disclosure_sections(disclosures)
     news_cards = render_news_sections(news_items)
@@ -115,11 +116,9 @@ def render_dashboard() -> str:
       const itemCards = Array.from(document.querySelectorAll("[data-item-key]"));
       const hiddenItemsStorageKey = "daily-report-hidden-item-keys";
       const hiddenItemsResetAtStorageKey = "daily-report-hidden-item-reset-at";
-      const hiddenItemsResetAfterMs = 24 * 60 * 60 * 1000;
       let pollTimer = null;
       let awaitingRunCompletion = false;
       let observedCollectionRunning = false;
-      let newsRotationTimer = null;
       let slideshowTimer = null;
       let slideshowEnabled = false;
       let slideshowWakeLock = null;
@@ -130,7 +129,7 @@ def render_dashboard() -> str:
         "all-panel": "리포트와 공시를 시간순으로 함께 보여줍니다.",
         "reports-panel": "기업, 산업, 시황, 전략, 경제 리포트를 성격별로 묶어 보여줍니다.",
         "disclosures-panel": "DART, KIND, EDGAR와 공시 성격을 구분해 한 번에 확인합니다.",
-        "news-panel": "네이버 뉴스와 커뮤니티 새소식을 모아 중복을 줄여 보여줍니다.",
+        "news-panel": "다음 뉴스와 커뮤니티 새소식을 모아 중복을 줄여 보여줍니다.",
       };
 
       function activateTab(targetId) {
@@ -168,12 +167,7 @@ def render_dashboard() -> str:
 
       function getHiddenItemIds() {
         try {
-          const resetAt = Number(window.localStorage.getItem(hiddenItemsResetAtStorageKey) || 0);
-          if (resetAt && Date.now() >= resetAt) {
-            window.localStorage.removeItem(hiddenItemsStorageKey);
-            window.localStorage.removeItem(hiddenItemsResetAtStorageKey);
-            return [];
-          }
+          window.localStorage.removeItem(hiddenItemsResetAtStorageKey);
           const raw = window.localStorage.getItem(hiddenItemsStorageKey);
           const parsed = raw ? JSON.parse(raw) : [];
           return Array.isArray(parsed) ? parsed : [];
@@ -183,17 +177,28 @@ def render_dashboard() -> str:
       }
 
       function setHiddenItemIds(ids) {
-        window.localStorage.setItem(hiddenItemsStorageKey, JSON.stringify(ids));
-        if (ids.length && !Number(window.localStorage.getItem(hiddenItemsResetAtStorageKey) || 0)) {
-          window.localStorage.setItem(hiddenItemsResetAtStorageKey, String(Date.now() + hiddenItemsResetAfterMs));
+        window.localStorage.setItem(hiddenItemsStorageKey, JSON.stringify(Array.from(new Set(ids))));
+        window.localStorage.removeItem(hiddenItemsResetAtStorageKey);
+      }
+
+      function getItemReadKeys(card) {
+        if (!card) {
+          return [];
         }
+        let aliases = [];
+        try {
+          aliases = JSON.parse(card.dataset.itemReadKeys || "[]");
+        } catch (_error) {
+          aliases = [];
+        }
+        const keys = [card.dataset.itemKey, ...aliases].filter(Boolean);
+        return Array.from(new Set(keys));
       }
 
       function renderItemVisibility() {
         const hiddenIds = new Set(getHiddenItemIds());
         itemCards.forEach((card) => {
-          const itemKey = card.dataset.itemKey;
-          const shouldHide = Boolean(itemKey && hiddenIds.has(itemKey));
+          const shouldHide = getItemReadKeys(card).some((itemKey) => hiddenIds.has(itemKey));
           card.hidden = shouldHide;
           card.classList.toggle("is-hidden-by-user", shouldHide);
         });
@@ -209,18 +214,15 @@ def render_dashboard() -> str:
 
       function hideItem(item) {
         const card = typeof item === "string" ? itemCards.find((candidate) => candidate.dataset.itemKey === item) : item;
-        const itemKey = typeof item === "string" ? item : card?.dataset.itemKey;
-        if (!itemKey) {
+        const itemKeys = typeof item === "string" ? [item] : getItemReadKeys(card);
+        if (!itemKeys.length) {
           return;
         }
         const wasNavigationCurrent = Boolean(card?.classList.contains("is-navigation-current"));
         const navigationCards = card ? getNewsNavigationCards(card) : [];
         const navigationIndex = card ? navigationCards.indexOf(card) : -1;
         const hiddenIds = getHiddenItemIds();
-        if (!hiddenIds.includes(itemKey)) {
-          hiddenIds.push(itemKey);
-          setHiddenItemIds(hiddenIds);
-        }
+        setHiddenItemIds([...hiddenIds, ...itemKeys]);
         renderItemVisibility();
         if (wasNavigationCurrent && card && navigationCards.length > 1) {
           const nextIndex = (navigationIndex + 1 + navigationCards.length) % navigationCards.length;
@@ -255,6 +257,31 @@ def render_dashboard() -> str:
         }
       }
 
+      function hideCategoryItems(button) {
+        const category = button.closest(".category-block");
+        if (!category) {
+          return;
+        }
+        const categoryCards = Array.from(category.querySelectorAll("[data-item-key]")).filter((card) => !card.hidden);
+        if (!categoryCards.length) {
+          return;
+        }
+        const hiddenIds = getHiddenItemIds();
+        const nextIds = new Set(hiddenIds);
+        categoryCards.forEach((card) => {
+          getItemReadKeys(card).forEach((itemKey) => nextIds.add(itemKey));
+          card.classList.remove("is-expanded");
+          card.querySelector(".card-title-button")?.setAttribute("aria-expanded", "false");
+        });
+        setHiddenItemIds(Array.from(nextIds));
+        clearNewsNavigation(category);
+        renderItemVisibility();
+        ensureActiveNewsCategory();
+        if (slideshowEnabled) {
+          refreshSlideshow();
+        }
+      }
+
       function getVisibleNewsButtons() {
         return newsFilterButtons.filter((button) => {
           const panel = document.getElementById(button.dataset.newsTarget || "");
@@ -279,35 +306,6 @@ def render_dashboard() -> str:
         if (!activeButton || !visibleButtons.includes(activeButton)) {
           activateNewsCategory(visibleButtons[0].dataset.newsTarget);
         }
-      }
-
-      function clearNewsRotation() {
-        if (newsRotationTimer) {
-          window.clearInterval(newsRotationTimer);
-          newsRotationTimer = null;
-        }
-      }
-
-      function startNewsRotation() {
-        clearNewsRotation();
-        newsRotationTimer = window.setInterval(() => {
-          if (slideshowEnabled) {
-            return;
-          }
-          const newsPanelActive = document.getElementById("news-panel")?.classList.contains("is-active");
-          if (!newsPanelActive) {
-            return;
-          }
-          const visibleButtons = getVisibleNewsButtons();
-          if (visibleButtons.length <= 1) {
-            return;
-          }
-          const currentIndex = visibleButtons.findIndex((button) => button.classList.contains("is-active"));
-          const nextButton = visibleButtons[(currentIndex + 1) % visibleButtons.length];
-          if (nextButton) {
-            activateNewsCategory(nextButton.dataset.newsTarget);
-          }
-        }, 15000);
       }
 
       function getActivePanel() {
@@ -353,9 +351,29 @@ def render_dashboard() -> str:
           candidate.classList.toggle("is-navigation-current", active);
           candidate.classList.toggle("is-navigation-focus", active);
         });
+        expandItemCard(target, true);
         target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
         window.setTimeout(() => target.classList.remove("is-navigation-focus"), 900);
         updateCategoryBlocks();
+      }
+
+      function getExpansionScope(card) {
+        return card.closest(".category-block") || card.closest(".tab-panel") || document;
+      }
+
+      function expandItemCard(card, forceOpen = false) {
+        if (!card) {
+          return;
+        }
+        const scope = getExpansionScope(card);
+        const wasExpanded = card.classList.contains("is-expanded");
+        scope.querySelectorAll("[data-item-key]").forEach((candidate) => {
+          candidate.classList.remove("is-expanded");
+          candidate.querySelector(".card-title-button")?.setAttribute("aria-expanded", "false");
+        });
+        const shouldExpand = forceOpen || !wasExpanded;
+        card.classList.toggle("is-expanded", shouldExpand);
+        card.querySelector(".card-title-button")?.setAttribute("aria-expanded", String(shouldExpand));
       }
 
       function navigateNewsCard(card, direction) {
@@ -598,8 +616,6 @@ def render_dashboard() -> str:
           }
           if (slideshowEnabled) {
             renderSlideshowFrame();
-          } else {
-            startNewsRotation();
           }
         });
       });
@@ -614,7 +630,7 @@ def render_dashboard() -> str:
         if (!(event.target instanceof Element)) {
           return;
         }
-        const button = event.target.closest(".item-hide-button, .item-nav-button, #slideshow-toggle");
+        const button = event.target.closest(".category-read-button, .card-title-button, .item-hide-button, #slideshow-toggle");
         if (!button) {
           return;
         }
@@ -629,22 +645,27 @@ def render_dashboard() -> str:
           return;
         }
 
+        if (button.classList.contains("category-read-button")) {
+          hideCategoryItems(button);
+          return;
+        }
+
         const card = button.closest("[data-item-key]");
         if (!card) {
+          return;
+        }
+        if (button.classList.contains("card-title-button")) {
+          expandItemCard(card);
           return;
         }
         if (button.classList.contains("item-hide-button")) {
           hideItem(card);
           return;
         }
-        if (button.classList.contains("item-nav-button")) {
-          navigateNewsCard(card, button.dataset.itemNav || button.dataset.newsNav);
-        }
       });
 
       renderItemVisibility();
       ensureActiveNewsCategory();
-      startNewsRotation();
       refreshSlideshow();
       pollStatus();
     </script>
@@ -763,29 +784,30 @@ def is_report(item: dict[str, str]) -> bool:
     return not is_disclosure(item) and not is_news(item)
 
 
+def published_sort_value(item: dict[str, str]) -> datetime:
+    try:
+        published_at = datetime.fromisoformat(item.get("published_at", ""))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if published_at.tzinfo is None:
+        return published_at.replace(tzinfo=timezone.utc)
+    return published_at.astimezone(timezone.utc)
+
+
+def sort_items_by_published_desc(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(items, key=published_sort_value, reverse=True)
+
+
 def get_news_category(item: dict[str, str]) -> str:
     source_name = item.get("source_name", "")
     if "네이버 뉴스 " in source_name:
         return source_name.removeprefix("네이버 뉴스 ").strip() or "뉴스"
+    if "다음 뉴스 " in source_name:
+        return source_name.removeprefix("다음 뉴스 ").strip() or "뉴스"
     if "클리앙" in source_name or "다모앙" in source_name:
         return "커뮤니티"
     tags = [part.strip() for part in item.get("tags", "").split(",") if part.strip()]
     return tags[0] if tags else "기타"
-
-
-def compact_summary(summary: str, *, max_length: int = 140) -> str:
-    for line in summary.splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        for prefix in ("핵심:", "영향:", "체크포인트:", "비고:"):
-            if text.startswith(prefix):
-                text = text.removeprefix(prefix).strip()
-                break
-        if text:
-            return text[:max_length].rstrip() + ("..." if len(text) > max_length else "")
-    flat = " ".join(summary.split())
-    return flat[:max_length].rstrip() + ("..." if len(flat) > max_length else "")
 
 
 def canonical_item_key(item: dict[str, str]) -> str:
@@ -809,6 +831,32 @@ def canonical_item_key(item: dict[str, str]) -> str:
     return f"{source_type}|{source_name}|{normalized_title}|{published_at}"
 
 
+def item_read_keys(item: dict[str, str]) -> list[str]:
+    source_type = item.get("source_type", "").strip().lower()
+    source_name = item.get("source_name", "").strip().lower()
+    normalized_title = re.sub(r"\s+", " ", item.get("title", "").strip().lower())
+    url = (item.get("url") or "").strip()
+    keys = [canonical_item_key(item)]
+    if url:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path.rstrip("/")
+        query = "&".join(
+            f"{key}={value}"
+            for key, values in sorted(parse_qs(parsed.query).items())
+            if not key.lower().startswith("utm_")
+            for value in values
+        )
+        url_key = f"{host}{path}?{query}" if query else f"{host}{path}"
+        keys.append(f"url|{url_key}")
+        keys.append(f"{source_type}|url|{url_key}")
+    if normalized_title:
+        keys.append(f"title|{normalized_title}")
+        keys.append(f"{source_type}|title|{normalized_title}")
+        keys.append(f"{source_type}|{source_name}|title|{normalized_title}")
+    return list(dict.fromkeys(key for key in keys if key))
+
+
 def render_spotlight_section(
     reports: list[dict[str, str]],
     disclosures: list[dict[str, str]],
@@ -826,7 +874,8 @@ def render_spotlight_section(
     cards = []
     for label, category, item in spotlight_items:
         item_key = html.escape(canonical_item_key(item))
-        spotlight_attrs = f' data-item-key="{item_key}"'
+        item_keys = html.escape(json.dumps(item_read_keys(item), ensure_ascii=False))
+        spotlight_attrs = f' data-item-key="{item_key}" data-item-read-keys="{item_keys}"'
         cards.append(
             f"""
           <article class=\"spotlight-card\"{spotlight_attrs}>
@@ -835,7 +884,6 @@ def render_spotlight_section(
               <span class=\"spotlight-category\">{html.escape(category)}</span>
             </div>
             <h3><a href=\"{html.escape(item.get('url') or '#')}\" target=\"_blank\" rel=\"noreferrer\">{html.escape(item['title'])}</a></h3>
-            <p class=\"spotlight-summary\">{html.escape(compact_summary(item.get('summary', '')))}</p>
             <p class=\"spotlight-source\">{html.escape(item.get('source_name', ''))}</p>
           </article>
         """
@@ -847,7 +895,7 @@ def render_spotlight_section(
             <p class=\"eyebrow\">Spotlight</p>
             <h2>오늘 주목할 항목</h2>
           </div>
-          <p class=\"section-copy\">리포트, 공시, 뉴스에서 가장 먼저 볼 항목만 한 번 더 짧게 압축했습니다.</p>
+          <p class=\"section-copy\">리포트, 공시, 뉴스에서 가장 먼저 볼 제목만 모았습니다.</p>
         </div>
         <div class=\"spotlight-grid\">
           {''.join(cards)}
@@ -899,35 +947,30 @@ def render_grouped_sections(
     if not items:
         return render_empty(empty_message)
     grouped: dict[str, list[dict[str, str]]] = {}
-    for item in items:
+    for item in sort_items_by_published_desc(items):
         grouped.setdefault(category_getter(item), []).append(item)
     sections: list[str] = []
-    for category in category_order:
-        category_items = grouped.pop(category, [])
-        if not category_items:
-            continue
+    category_rank = {category: index for index, category in enumerate(category_order)}
+    ordered_groups = sorted(
+        grouped.items(),
+        key=lambda group: (
+            published_sort_value(group[1][0]),
+            -category_rank.get(group[0], len(category_order)),
+        ),
+        reverse=True,
+    )
+    for category, category_items in ordered_groups:
+        category_items = sort_items_by_published_desc(category_items)
         cards = "\n".join(render_card(item) for item in category_items)
         sections.append(
             f"""
           <section class=\"{block_class}\">
             <div class=\"category-head\">
               <h3>{html.escape(category)}</h3>
-              <span>{len(category_items)}건</span>
-            </div>
-            <div class=\"grid\">
-              {cards}
-            </div>
-          </section>
-        """
-        )
-    for category, category_items in grouped.items():
-        cards = "\n".join(render_card(item) for item in category_items)
-        sections.append(
-            f"""
-          <section class=\"{block_class}\">
-            <div class=\"category-head\">
-              <h3>{html.escape(category)}</h3>
-              <span>{len(category_items)}건</span>
+              <div class=\"category-actions\">
+                <span class=\"category-count\">{len(category_items)}건</span>
+                <button type=\"button\" class=\"category-read-button\">모두 읽음</button>
+              </div>
             </div>
             <div class=\"grid\">
               {cards}
@@ -961,17 +1004,42 @@ def render_disclosure_sections(items: list[dict[str, str]]) -> str:
 def render_news_sections(items: list[dict[str, str]]) -> str:
     if not items:
         return render_empty("뉴스가 아직 없습니다.")
-    category_order = ["경제", "사회", "생활/문화", "세계", "IT/과학", "커뮤니티", "기타"]
+    category_order = [
+        "지방선거 새로운소식",
+        "기후/환경",
+        "사회",
+        "경제",
+        "정치",
+        "국제",
+        "문화",
+        "생활",
+        "IT/과학",
+        "인물",
+        "지식/칼럼",
+        "연재",
+        "커뮤니티",
+        "기타",
+    ]
     grouped: dict[str, list[dict[str, str]]] = {}
-    for item in items:
+    for item in sort_items_by_published_desc(items):
         grouped.setdefault(get_news_category(item), []).append(item)
-    ordered_categories = [category for category in category_order if grouped.get(category)]
-    ordered_categories.extend(category for category in grouped if category not in ordered_categories)
+    category_rank = {category: index for index, category in enumerate(category_order)}
+    ordered_categories = [
+        category
+        for category, _category_items in sorted(
+            grouped.items(),
+            key=lambda group: (
+                published_sort_value(group[1][0]),
+                -category_rank.get(group[0], len(category_order)),
+            ),
+            reverse=True,
+        )
+    ]
     first_category = ordered_categories[0]
     buttons = []
     panels = []
     for category in ordered_categories:
-        category_items = grouped[category]
+        category_items = sort_items_by_published_desc(grouped[category])
         category_id = category.replace("/", "-").replace(" ", "-")
         cards = "\n".join(render_card(item) for item in category_items)
         is_active = category == first_category
@@ -993,7 +1061,10 @@ def render_news_sections(items: list[dict[str, str]]) -> str:
           <section class=\"category-block news-category-block{' is-active' if is_active else ''}\" id=\"news-category-{html.escape(category_id)}\" {'hidden' if not is_active else ''}>
             <div class=\"category-head\">
               <h3>{html.escape(category)}</h3>
-              <span>{len(category_items)}건</span>
+              <div class=\"category-actions\">
+                <span class=\"category-count\">{len(category_items)}건</span>
+                <button type=\"button\" class=\"category-read-button\">모두 읽음</button>
+              </div>
             </div>
             <div class=\"grid\">
               {cards}
@@ -1029,37 +1100,29 @@ def render_card(item: dict[str, str]) -> str:
     else:
         card_class = "card is-report"
     title = html.escape(item["title"])
-    source_name = html.escape(item["source_name"])
-    source_type = html.escape(item["source_type"])
-    summary = "<br />".join(html.escape(line) for line in item["summary"].splitlines())
-    tags = html.escape(item.get("tags", ""))
     link = item.get("url") or "#"
-    published_at = html.escape(item["published_at"])
     item_id = html.escape(str(item.get("id", "")))
     item_key = html.escape(canonical_item_key(item))
+    item_keys = html.escape(json.dumps(item_read_keys(item), ensure_ascii=False))
     item_kind = "news" if is_news(item) else "disclosure" if is_disclosure(item) else "report"
-    item_attrs = f' data-item-id="{item_id}" data-item-key="{item_key}" data-item-kind="{item_kind}"'
-    item_nav_buttons = """
-            <button type="button" class="item-nav-button" data-item-nav="previous" aria-label="이전 항목으로 이동">이전</button>
-            <button type="button" class="item-nav-button" data-item-nav="next" aria-label="다음 항목으로 이동">이후</button>
-        """
+    item_attrs = f' data-item-id="{item_id}" data-item-key="{item_key}" data-item-read-keys="{item_keys}" data-item-kind="{item_kind}"'
     hide_button = """
         <button type="button" class="item-hide-button" aria-label="읽은 항목 숨기기">읽음</button>
     """
+    link_button = f"""
+        <a class="item-link-button" href="{html.escape(link)}" target="_blank" rel="noreferrer">원문</a>
+    """
     return f"""
       <article class=\"{card_class}\"{item_attrs}>
-        <div class=\"meta-row\">
-          <span class=\"pill\">{source_type}</span>
-          <span class=\"meta\">{source_name}</span>
-          <span class=\"meta\">{published_at}</span>
-          <span class=\"meta-actions\">
-            {item_nav_buttons}
-            {hide_button}
-          </span>
+        <div class=\"card-title-row\">
+          <h3>
+            <button type=\"button\" class=\"card-title-button\" aria-expanded=\"false\">{title}</button>
+          </h3>
+          {hide_button}
         </div>
-        <h3><a href=\"{html.escape(link)}\" target=\"_blank\" rel=\"noreferrer\">{title}</a></h3>
-        <p class=\"summary\">{summary}</p>
-        <p class=\"tags\">{tags}</p>
+        <div class=\"item-original-row\">
+          {link_button}
+        </div>
       </article>
     """
 
