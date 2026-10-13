@@ -11,9 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from config import load_env_file
 from db import fetch_recent_items, init_db
 from pipeline import pipeline_result_to_dict, run_pipeline
-from sources import news_collection_window_start
+from sources import news_collection_window_start, normalize_news_url, parse_published_datetime
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +34,7 @@ JOB_STATE: dict[str, object] = {
     "errors": 0,
     "mode": "",
     "last_result": None,
+    "source_results": [],
 }
 
 
@@ -47,7 +49,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._respond_html(render_dashboard())
             return
         if parsed.path == "/api/items":
-            items = [dict(row) for row in fetch_recent_items(since=news_collection_window_start())]
+            items = [dict(row) for row in fetch_recent_items(limit=None, since=news_collection_window_start())]
             self._respond_json({"items": items})
             return
         if parsed.path == "/api/status":
@@ -91,7 +93,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def render_dashboard() -> str:
-    rows = sort_items_by_published_desc([dict(row) for row in fetch_recent_items(since=news_collection_window_start())])
+    rows = sort_items_by_published_desc([dict(row) for row in fetch_recent_items(limit=None, since=news_collection_window_start())])
     reports = sort_items_by_published_desc([row for row in rows if is_report(row)])
     disclosures = sort_items_by_published_desc([row for row in rows if is_disclosure(row)])
     news_items = sort_items_by_published_desc([row for row in rows if is_news(row)])
@@ -560,10 +562,24 @@ def render_dashboard() -> str:
         progressFill.style.width = `${percent}%`;
         progressMeta.textContent = `${status.message || "진행 중"} · 수집 ${fetched}건 · 저장 ${stored}건 · 오류 ${errors}건`;
         progressTitle.textContent = status.current_title || status.current_source || "";
+        const sourceResults = status.source_results || [];
+        const sourceList = document.getElementById("source-results");
+        sourceList.replaceChildren();
+        sourceResults.forEach((source) => {
+          const item = document.createElement("li");
+          const outcome = source.status === "error" ? `실패: ${source.message}`
+            : source.status === "skipped" ? `건너뜀: ${source.message}`
+            : source.status === "empty" ? "수집 기간 내 항목 없음"
+            : `${source.fetched}건 수집`;
+          item.textContent = `${source.name} · ${outcome}`;
+          sourceList.appendChild(item);
+        });
         if (status.running) {
           statusText.textContent = `${status.phase} 진행 중...`;
         } else if (status.phase === "completed") {
           statusText.textContent = `완료: ${stored}건 저장 / 모드 ${status.mode}`;
+        } else if (status.phase === "failed") {
+          statusText.textContent = status.message || "수집에 실패했습니다.";
         }
       }
 
@@ -697,6 +713,10 @@ def render_dashboard() -> str:
             </div>
             <p class=\"progress-meta\" id=\"progress-meta\">진행 대기 중</p>
             <p class=\"progress-title\" id=\"progress-title\"></p>
+            <details>
+              <summary>소스별 수집 결과</summary>
+              <ul id=\"source-results\"></ul>
+            </details>
           </div>
           <div class=\"hero-stats\">
             <div class=\"stat-box\">
@@ -786,7 +806,7 @@ def is_report(item: dict[str, str]) -> bool:
 
 def published_sort_value(item: dict[str, str]) -> datetime:
     try:
-        published_at = datetime.fromisoformat(item.get("published_at", ""))
+        published_at = parse_published_datetime(item.get("published_at", ""))
     except ValueError:
         return datetime.min.replace(tzinfo=timezone.utc)
     if published_at.tzinfo is None:
@@ -850,7 +870,8 @@ def item_read_keys(item: dict[str, str]) -> list[str]:
         url_key = f"{host}{path}?{query}" if query else f"{host}{path}"
         keys.append(f"url|{url_key}")
         keys.append(f"{source_type}|url|{url_key}")
-    if normalized_title:
+        keys.append(f"{source_type}|url|{normalize_news_url(url)}")
+    if normalized_title and not url:
         keys.append(f"title|{normalized_title}")
         keys.append(f"{source_type}|title|{normalized_title}")
         keys.append(f"{source_type}|{source_name}|title|{normalized_title}")
@@ -1005,6 +1026,8 @@ def render_news_sections(items: list[dict[str, str]]) -> str:
     if not items:
         return render_empty("뉴스가 아직 없습니다.")
     category_order = [
+        "홈",
+        "매거진",
         "지방선거 새로운소식",
         "기후/환경",
         "사회",
@@ -1156,6 +1179,7 @@ def start_background_run(*, trigger: str = "manual") -> bool:
                 "mode": "",
                 "trigger": trigger,
                 "last_result": None,
+                "source_results": [],
             }
         )
 
@@ -1174,6 +1198,7 @@ def start_background_run(*, trigger: str = "manual") -> bool:
                     "errors": len(result.errors),
                     "mode": result.mode,
                     "last_result": pipeline_result_to_dict(result),
+                    "source_results": result.source_results,
                 }
             )
         except Exception as exc:  # pragma: no cover - server safety
@@ -1202,6 +1227,7 @@ def start_auto_collection_scheduler() -> None:
 
 
 def main() -> None:
+    load_env_file()
     init_db()
     start_auto_collection_scheduler()
     server = ReusableThreadingHTTPServer(("127.0.0.1", 8000), DashboardHandler)

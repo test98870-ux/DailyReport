@@ -68,6 +68,15 @@
   },
   {
     "type": "daum_news_section",
+    "name": "다음 뉴스 홈",
+    "source_type": "뉴스",
+    "section_url": "https://news.daum.net/",
+    "section_name": "홈",
+    "limit": 0,
+    "hours": 24
+  },
+  {
+    "type": "daum_news_section",
     "name": "다음 뉴스 지방선거 새로운소식",
     "source_type": "뉴스",
     "section_url": "https://issue.daum.net/election/2026",

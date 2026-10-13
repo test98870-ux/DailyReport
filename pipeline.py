@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Callable
 import re
-from urllib.parse import parse_qs, urlparse
 
-from db import clear_items, init_db, upsert_item
-from sources import SourceItem, build_sources
+from db import init_db, upsert_item
+from sources import SourceItem, build_sources, normalize_news_url
 
 
 @dataclass
@@ -16,6 +15,7 @@ class PipelineResult:
     stored: int
     mode: str
     errors: list[str]
+    source_results: list[dict[str, object]] = field(default_factory=list)
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
@@ -23,8 +23,8 @@ ProgressCallback = Callable[[dict[str, object]], None]
 
 def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineResult:
     init_db()
-    clear_items()
     errors: list[str] = []
+    source_results: list[dict[str, object]] = []
     stored = 0
     items: list[SourceItem] = []
     mode = "title-only"
@@ -45,12 +45,13 @@ def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineR
 
     for source in build_sources():
         source_count += 1
+        source_name = getattr(source, "name", getattr(source, "source_name", source.__class__.__name__))
         emit_progress(
             progress_callback,
             {
                 "phase": "fetching",
-                "message": f"{source.__class__.__name__} 수집 중",
-                "current_source": source.__class__.__name__,
+                "message": f"{source_name} 수집 중",
+                "current_source": source_name,
                 "fetched": len(items),
                 "stored": stored,
                 "total_items": len(items),
@@ -61,12 +62,17 @@ def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineR
         try:
             fetched_items = source.fetch()
             items.extend(fetched_items)
+            source_result: dict[str, object] = {"name": source_name, "status": "ok" if fetched_items else "empty", "fetched": len(fetched_items)}
+            if getattr(source, "skip_reason", ""):
+                source_result.update(status="skipped", message=source.skip_reason)
+            source_results.append(source_result)
             emit_progress(
                 progress_callback,
                 {
                     "phase": "fetching",
-                    "message": f"{source.__class__.__name__}에서 {len(fetched_items)}건 수집",
-                    "current_source": source.__class__.__name__,
+                    "message": f"{source_name}에서 {len(fetched_items)}건 수집",
+                    "current_source": source_name,
+                    "source_results": list(source_results),
                     "fetched": len(items),
                     "stored": stored,
                     "total_items": len(items),
@@ -75,13 +81,15 @@ def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineR
                 },
             )
         except Exception as exc:  # pragma: no cover - broad to keep the batch alive
-            errors.append(f"{source.__class__.__name__}: {exc}")
+            errors.append(f"{source_name}: {exc}")
+            source_results.append({"name": source_name, "status": "error", "fetched": 0, "message": str(exc)})
             emit_progress(
                 progress_callback,
                 {
                     "phase": "fetching",
-                    "message": f"{source.__class__.__name__} 수집 실패",
-                    "current_source": source.__class__.__name__,
+                    "message": f"{source_name} 수집 실패",
+                    "current_source": source_name,
+                    "source_results": list(source_results),
                     "fetched": len(items),
                     "stored": stored,
                     "total_items": len(items),
@@ -181,6 +189,7 @@ def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineR
         stored=stored,
         mode=mode,
         errors=errors,
+        source_results=source_results,
     )
     emit_progress(
         progress_callback,
@@ -207,42 +216,19 @@ def dedupe_items(items: list[SourceItem]) -> list[SourceItem]:
     seen_keys: set[str] = set()
     for item in items:
         url_key = canonical_url_key(item.url)
-        title_key = canonical_title_key(item.title)
-        keys = [key for key in [url_key, title_key] if key]
-        if any(key in seen_keys for key in keys):
+        # Distinct reports/filings can legitimately have the same headline.
+        key = f"{item.source_type}|url|{url_key}" if url_key else (
+            f"{item.source_type}|{item.source_name}|{canonical_title_key(item.title)}|{item.published_at}"
+        )
+        if key in seen_keys:
             continue
-        seen_keys.update(keys)
+        seen_keys.add(key)
         deduped.append(item)
     return deduped
 
 
 def canonical_url_key(url: str) -> str:
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().replace("www.", "")
-    path = parsed.path.rstrip("/")
-    if "n.news.naver.com" in host:
-        match = re.search(r"/article/(\d+)/(\d+)", path)
-        if match:
-            return f"naver:{match.group(1)}:{match.group(2)}"
-    if "news.naver.com" in host:
-        query = parse_qs(parsed.query)
-        oid = query.get("oid", [""])[0]
-        aid = query.get("aid", [""])[0]
-        if oid and aid:
-            return f"naver:{oid}:{aid}"
-    if "v.daum.net" in host:
-        match = re.search(r"/v/(\d+)", path)
-        if match:
-            return f"daum:{match.group(1)}"
-    query = "&".join(
-        f"{key}={value}"
-        for key, values in sorted(parse_qs(parsed.query).items())
-        if not key.lower().startswith("utm_")
-        for value in values
-    )
-    return f"{host}{path}?{query}" if query else f"{host}{path}"
+    return normalize_news_url(url)
 
 
 def canonical_title_key(title: str) -> str:

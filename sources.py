@@ -7,11 +7,14 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from typing import Iterable
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
+
+from config import load_env_file
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,6 +56,15 @@ def title_only_content(*parts: str) -> str:
 class Source:
     def fetch(self) -> list[SourceItem]:
         raise NotImplementedError
+
+
+class SkippedSource(Source):
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.skip_reason = reason
+
+    def fetch(self) -> list[SourceItem]:
+        return []
 
 
 def fetch_text(url: str, encoding: str | None = None, headers: dict[str, str] | None = None) -> str:
@@ -99,7 +111,32 @@ def parse_daum_article_datetime(article_url: str) -> str:
     match = re.search(r"/v/(\d{14})", article_url)
     if not match:
         return ""
-    return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=KST).isoformat()
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=KST).isoformat()
+    except ValueError:
+        return ""
+
+
+def parse_daum_created_at(raw: str, article_url: str) -> str:
+    raw = raw.strip()
+    for candidate in (raw, raw.replace("Z", "+00:00")):
+        try:
+            return parse_published_datetime(candidate).isoformat()
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(raw, fmt).isoformat()
+        except ValueError:
+            pass
+    return parse_daum_article_datetime(article_url)
+
+
+def decode_js_string(raw: str) -> str:
+    try:
+        return json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        return raw.replace('\\"', '"').replace("\\/", "/").replace("\\\\", "\\")
 
 
 def normalize_whitespace(text: str) -> str:
@@ -107,42 +144,50 @@ def normalize_whitespace(text: str) -> str:
 
 
 def normalize_news_url(url: str) -> str:
+    if not url:
+        return ""
     parsed = urlparse(url)
     host = parsed.netloc.lower().replace("www.", "")
     path = parsed.path.rstrip("/")
-    if "n.news.naver.com" in host:
+    if host == "n.news.naver.com":
         match = re.search(r"/article/(\d+)/(\d+)", path)
         if match:
             return f"naver:{match.group(1)}:{match.group(2)}"
-    if "news.naver.com" in host:
+    if host == "news.naver.com":
         query = parse_qs(parsed.query)
         oid = query.get("oid", [""])[0]
         aid = query.get("aid", [""])[0]
         if oid and aid:
             return f"naver:{oid}:{aid}"
-    if "v.daum.net" in host:
+    if host == "v.daum.net":
         match = re.search(r"/v/(\d+)", path)
         if match:
             return f"daum:{match.group(1)}"
-    filtered_query = "&".join(
-        f"{key}={value}"
+    filtered_query = urlencode([
+        (key, value)
         for key, values in sorted(parse_qs(parsed.query).items())
         if not key.lower().startswith("utm_")
         for value in values
-    )
+    ])
     normalized = f"{host}{path}"
     if filtered_query:
         normalized = f"{normalized}?{filtered_query}"
     return normalized
 
 
+def parse_published_datetime(raw: str) -> datetime:
+    published = datetime.fromisoformat(raw)
+    return published if published.tzinfo is not None else published.replace(tzinfo=KST)
+
+
 def within_last_hours(published_at: str, hours: int) -> bool:
     try:
-        published = datetime.fromisoformat(published_at)
+        published = parse_published_datetime(published_at)
     except ValueError:
         return False
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(hours, collection_window_days() * 24))
-    return published.astimezone(timezone.utc) >= cutoff
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max(hours, collection_window_days() * 24))
+    return cutoff <= published.astimezone(timezone.utc) <= now
 
 
 def collection_window_days() -> int:
@@ -161,7 +206,7 @@ def news_collection_window_start(now: datetime | None = None) -> datetime:
 
 def within_news_collection_window(published_at: str, now: datetime | None = None) -> bool:
     try:
-        published = datetime.fromisoformat(published_at).astimezone(timezone.utc)
+        published = parse_published_datetime(published_at).astimezone(timezone.utc)
     except ValueError:
         return False
     now_utc = (now or datetime.now(KST)).astimezone(timezone.utc)
@@ -171,7 +216,7 @@ def within_news_collection_window(published_at: str, now: datetime | None = None
 
 def before_news_collection_window(published_at: str, now: datetime | None = None) -> bool:
     try:
-        published = datetime.fromisoformat(published_at).astimezone(timezone.utc)
+        published = parse_published_datetime(published_at).astimezone(timezone.utc)
     except ValueError:
         return False
     return published < news_collection_window_start(now).astimezone(timezone.utc)
@@ -223,7 +268,7 @@ class RssSource(Source):
             published = self._normalize_date(
                 node.findtext("pubDate") or datetime.now(timezone.utc).isoformat()
             )
-            if not title or not description:
+            if not title:
                 continue
             items.append(
                 SourceItem(
@@ -232,7 +277,7 @@ class RssSource(Source):
                     title=title,
                     url=link,
                     published_at=published,
-                    content=description,
+                    content=strip_tags(description) or title,
                     tags=[],
                 )
             )
@@ -241,8 +286,11 @@ class RssSource(Source):
     @staticmethod
     def _normalize_date(raw: str) -> str:
         try:
-            return datetime.strptime(raw, "%a, %d %b %Y %H:%M:%S %z").isoformat()
-        except ValueError:
+            published = parsedate_to_datetime(raw)
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+            return published.isoformat()
+        except (TypeError, ValueError):
             return raw
 
 
@@ -331,6 +379,8 @@ class OpenDartSource(Source):
         body = fetch_text(f"{DART_LIST_API}?{urlencode(params)}", encoding="utf-8")
         payload = json.loads(body)
         status = payload.get("status")
+        if status == "013":  # A valid request with no filings in this period.
+            return []
         if status != "000":
             raise RuntimeError(payload.get("message", f"OpenDART error: {status}"))
 
@@ -673,9 +723,7 @@ class NaverNewsSectionSource(Source):
             item = self._fetch_article(link, title)
             if item is None:
                 continue
-            if not within_news_collection_window(published_at):
-                if before_news_collection_window(item.published_at):
-                    break
+            if not within_news_collection_window(item.published_at):
                 continue
             items.append(item)
             if self.limit > 0 and len(items) >= self.limit:
@@ -734,48 +782,106 @@ class DaumNewsSectionSource(Source):
             encoding="utf-8",
             headers={"Referer": DAUM_NEWS_BASE, "User-Agent": "Mozilla/5.0 DailyReportBot/1.0"},
         )
-        matches = re.findall(
-            r'<a[^>]+href="(https://v\.daum\.net/v/\d+)"[^>]*>(.*?)</a>',
-            html_text,
-            flags=re.S,
-        )
         items: list[SourceItem] = []
         seen_urls: set[str] = set()
-        for link, anchor_html in matches:
-            normalized_url = normalize_news_url(link)
+
+        # Embedded data includes cards hidden behind the site's carousel controls.
+        candidates = self._extract_embedded_items(html_text) + self._extract_anchor_items(html_text)
+        for item in candidates:
+            normalized_url = normalize_news_url(item.url)
             if normalized_url in seen_urls:
                 continue
             seen_urls.add(normalized_url)
-            title = self._extract_listing_title(anchor_html)
+            items.append(item)
+        if not candidates and not re.search(r'https://v\.daum\.net/v/\d+|hamny-\d+', html_text):
+            raise RuntimeError("다음 기사 목록을 찾지 못했습니다. 페이지 구조나 응답을 확인하세요.")
+        items.sort(key=lambda item: parse_published_datetime(item.published_at), reverse=True)
+        return items[:self.limit] if self.limit > 0 else items
+
+    def _extract_anchor_items(self, html_text: str) -> list[SourceItem]:
+        items: list[SourceItem] = []
+        seen_urls: set[str] = set()
+        matches = re.finditer(
+            r'''(<a\b[^>]+href=["'](https://v\.daum\.net/v/\d+)(?:[?#][^"']*)?["'][^>]*>(.*?)</a>)''',
+            html_text,
+            flags=re.S,
+        )
+        for match in matches:
+            full_anchor, link, anchor_html = match.groups()
+            normalized_url = normalize_news_url(link)
+            if normalized_url in seen_urls:
+                continue
+            title = self._extract_listing_title(anchor_html, full_anchor)
             published_at = parse_daum_article_datetime(link)
             if not title or not published_at:
                 continue
             if not within_news_collection_window(published_at):
-                if before_news_collection_window(published_at):
-                    break
                 continue
+            seen_urls.add(normalized_url)
             press_name = self._extract_listing_press(anchor_html)
+            block_title = self._extract_anchor_block_title(html_text, match.start())
             item = SourceItem(
                 source_type=self.source_type,
-                source_name=self.name,
+                source_name=self._source_name_for_block(block_title),
                 title=title,
                 url=link,
                 published_at=published_at,
-                content=title_only_content(self.section_name, press_name, title),
-                tags=[value for value in [self.section_name, press_name] if value],
+                content=title_only_content(self.section_name, block_title, press_name, title),
+                tags=[value for value in [self.section_name, block_title, press_name] if value],
             )
             items.append(item)
-            if self.limit > 0 and len(items) >= self.limit:
-                break
         return items
 
-    def _extract_listing_title(self, anchor_html: str) -> str:
+    def _extract_embedded_items(self, html_text: str) -> list[SourceItem]:
+        pattern = re.compile(
+            r'\{\s*"?id"?\s*:\s*"hamny-\d+"'
+            r'(?P<fields>(?:[^{}"\\]|"(?:\\.|[^"\\])*")*)\}',
+            flags=re.S,
+        )
+        items: list[SourceItem] = []
+        seen_urls: set[str] = set()
+        for match in pattern.finditer(html_text):
+            fields = {
+                key: decode_js_string(value)
+                for key, value in re.findall(
+                    r'"?(title|pcUrl|cpName|createdAt)"?\s*:\s*"((?:\\.|[^"\\])*)"',
+                    match.group("fields"),
+                )
+            }
+            url_match = re.fullmatch(r'https://v\.daum\.net/v/(\d+)(?:[?#].*)?', fields.get("pcUrl", ""))
+            if not url_match:
+                continue
+            link = f"https://v.daum.net/v/{url_match.group(1)}"
+            normalized_url = normalize_news_url(link)
+            if normalized_url in seen_urls:
+                continue
+            title = html.unescape(fields.get("title", "")).strip()
+            press_name = fields.get("cpName", "").strip()
+            published_at = parse_daum_created_at(fields.get("createdAt", ""), link)
+            if not title or not published_at or not within_news_collection_window(published_at):
+                continue
+            seen_urls.add(normalized_url)
+            block_title = self._extract_embedded_block_title(html_text, match.start())
+            items.append(
+                SourceItem(
+                    source_type=self.source_type,
+                    source_name=self._source_name_for_block(block_title),
+                    title=title,
+                    url=link,
+                    published_at=published_at,
+                    content=title_only_content(self.section_name, block_title, press_name, title),
+                    tags=[value for value in [self.section_name, block_title, press_name] if value],
+                )
+            )
+        return items
+
+    def _extract_listing_title(self, anchor_html: str, full_anchor: str = "") -> str:
         title_match = re.search(r'<strong[^>]+class="[^"]*tit_txt[^"]*"[^>]*>(.*?)</strong>', anchor_html, flags=re.S)
         if title_match:
             return strip_tags(title_match.group(1))
-        data_title_match = re.search(r'data-title="([^"]+)"', anchor_html)
+        data_title_match = re.search(r'''data-title=(["'])(.*?)\1''', full_anchor or anchor_html, flags=re.S)
         if data_title_match:
-            return html.unescape(unquote(data_title_match.group(1))).strip()
+            return html.unescape(unquote(data_title_match.group(2))).strip()
         return ""
 
     def _extract_listing_press(self, anchor_html: str) -> str:
@@ -785,45 +891,103 @@ class DaumNewsSectionSource(Source):
                 return value
         return self.name
 
+    def _extract_anchor_block_title(self, html_text: str, position: int) -> str:
+        chunk = html_text[max(0, position - 4000) : position]
+        component_matches = re.findall(r"componentTitle=([^&\"]+)", chunk)
+        if component_matches:
+            return html.unescape(unquote(component_matches[-1])).strip()
+        box_title_matches = re.findall(r'<span class="txt_box">\s*(.*?)\s*</span>', chunk, flags=re.S)
+        if box_title_matches:
+            return strip_tags(box_title_matches[-1])
+        return self.section_name
+
+    def _extract_embedded_block_title(self, html_text: str, position: int) -> str:
+        chunk = html_text[max(0, position - 20000) : position]
+        contents_index = chunk.rfind("contents:[")
+        header = chunk[:contents_index] if contents_index >= 0 else chunk
+        title_matches = re.findall(r'(?:^|[,{])title:"((?:\\.|[^"\\])*)"', header)
+        for value in reversed(title_matches):
+            decoded = decode_js_string(value).strip()
+            if decoded and not decoded.startswith("["):
+                return decoded
+        return self.section_name
+
+    def _source_name_for_block(self, block_title: str) -> str:
+        if self.section_name == "홈" and "매거진" in block_title:
+            return "다음 뉴스 매거진"
+        return self.name
+
 
 class ClienNewsSource(Source):
-    def __init__(self, *, name: str, source_type: str = "뉴스", limit: int = 0, hours: int = 24) -> None:
+    def __init__(self, *, name: str, source_type: str = "뉴스", limit: int = 0, hours: int = 24, max_pages: int = 10) -> None:
         self.name = name
         self.source_type = source_type
         self.limit = limit
         self.hours = hours
+        self.max_pages = max(1, max_pages)
 
     def fetch(self) -> list[SourceItem]:
-        html_text = fetch_text(CLIEN_NEWS_URL, encoding="utf-8", headers={"Referer": "https://www.clien.net/service/"})
-        matches = re.findall(
-            r'<div class="list_item[^"]*?symph_row.*?<a class="list_subject" href="(?P<href>/service/board/news/\d+[^"]*)".*?'
-            r'<span class="subject_fixed"[^>]*title="(?P<title>[^"]+)".*?'
-            r'<span class="nickname">\s*<span title="(?P<author>[^"]+)">.*?'
-            r'<span class="timestamp">(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})</span>',
+        items: list[SourceItem] = []
+        seen_urls: set[str] = set()
+        now = datetime.now(KST)
+        for page in range(self.max_pages):
+            url = f"{CLIEN_NEWS_URL}?{urlencode({'po': page, 'od': 'T31'})}"
+            html_text = fetch_text(url, encoding="utf-8", headers={"Referer": "https://www.clien.net/service/"})
+            page_items = self._parse_page(html_text)
+            new_items = [item for item in page_items if item.url not in seen_urls]
+            if not new_items:
+                break
+            seen_urls.update(item.url for item in new_items)
+            for item in new_items:
+                if within_news_collection_window(item.published_at, now):
+                    items.append(item)
+                    if self.limit > 0 and len(items) >= self.limit:
+                        return items
+            # A pinned old post must not prevent newer posts on this page from being read.
+            if all(before_news_collection_window(item.published_at, now) for item in page_items):
+                break
+        return items
+
+    def _parse_page(self, html_text: str) -> list[SourceItem]:
+        rows = list(re.finditer(
+            r'<div\b[^>]*class="[^"]*\blist_item\b[^"]*"[^>]*>',
             html_text,
             flags=re.S,
-        )
+        ))
+        if not rows and 'class="list_content"' not in html_text:
+            raise RuntimeError("클리앙 게시글 목록을 찾지 못했습니다. 페이지 구조나 응답을 확인하세요.")
         items: list[SourceItem] = []
-        for href, title, author, timestamp in matches:
-            published_at = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).isoformat()
-            if not within_news_collection_window(published_at):
-                if before_news_collection_window(published_at):
-                    break
+        for index, row in enumerate(rows):
+            if "symph_row" not in row.group():
                 continue
+            end = rows[index + 1].start() if index + 1 < len(rows) else len(html_text)
+            block = html_text[row.end():end]
+            link_match = re.search(r'href="(/service/board/news/\d+[^\"]*)"', block)
+            title_match = re.search(r'<span[^>]*class="[^"]*\bsubject_fixed\b[^"]*"[^>]*title="([^"]+)"', block)
+            timestamp_match = re.search(r'<span[^>]*class="timestamp"[^>]*>\s*([^<]+)</span>', block)
+            if not link_match or not title_match or not timestamp_match:
+                continue
+            try:
+                published_at = datetime.strptime(timestamp_match.group(1).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).isoformat()
+            except ValueError:
+                continue
+            nickname_match = re.search(r'<span[^>]*class="[^"]*\bnickname\b[^"]*"[^>]*>(.*?)</span>', block, flags=re.S)
+            author_match = re.search(r'(?:title|alt)="([^"]+)"', nickname_match.group(1)) if nickname_match else None
+            author = html.unescape(author_match.group(1)).strip() if author_match else ""
+            href = html.unescape(link_match.group(1))
+            title = html.unescape(title_match.group(1)).strip()
             detail_url = urljoin("https://www.clien.net", href.split("?", 1)[0])
             items.append(
                 SourceItem(
                     source_type=self.source_type,
                     source_name=self.name,
-                    title=html.unescape(title).strip(),
+                    title=title,
                     url=detail_url,
                     published_at=published_at,
                     content=title_only_content("클리앙", author, title),
                     tags=[value for value in ["클리앙", author] if value],
                 )
             )
-            if self.limit > 0 and len(items) >= self.limit:
-                break
         return items
 
 
@@ -845,9 +1009,18 @@ class DamoangNewsSource(Source):
 
 
 def build_sources() -> Iterable[Source]:
+    load_env_file()
     if DEFAULT_CONFIG_FILE.exists():
         config = json.loads(DEFAULT_CONFIG_FILE.read_text(encoding="utf-8"))
         for row in config:
+            if not row.get("enabled", True):
+                continue
+            if row["type"] not in {
+                "rss", "sample_file", "naver_research", "opendart", "hankyung_consensus",
+                "wisereport", "edgar_company", "naver_news_section", "daum_news_section",
+                "clien_news", "damoang_news", "kind_rss",
+            }:
+                raise ValueError(f"지원하지 않는 소스 유형: {row['type']}")
             if row["type"] == "rss":
                 yield RssSource(
                     name=row["name"],
@@ -875,6 +1048,8 @@ def build_sources() -> Iterable[Source]:
                         corp_cls=row.get("corp_cls"),
                         days=int(row.get("days", 1)),
                     )
+                else:
+                    yield SkippedSource(row["name"], f"{row.get('api_key_env', 'OPENDART_API_KEY')} 미설정")
             if row["type"] == "hankyung_consensus":
                 yield HankyungConsensusSource(
                     name=row["name"],
@@ -924,6 +1099,7 @@ def build_sources() -> Iterable[Source]:
                     source_type=row.get("source_type", "뉴스"),
                     limit=int(row.get("limit", 12)),
                     hours=int(row.get("hours", 24)),
+                    max_pages=int(row.get("max_pages", 10)),
                 )
             if row["type"] == "damoang_news":
                 yield DamoangNewsSource(
