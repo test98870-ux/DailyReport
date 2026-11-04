@@ -12,7 +12,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from config import load_env_file
-from db import fetch_recent_items, init_db
+from db import fetch_recent_items, init_db, get_connection
+from article_reader import load_article
 from pipeline import pipeline_result_to_dict, run_pipeline
 from sources import news_collection_window_start, normalize_news_url, parse_published_datetime
 
@@ -45,6 +46,18 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/article":
+            item_id = parse_qs(parsed.query).get("id", [""])[0]
+            with get_connection() as conn:
+                item = conn.execute("SELECT * FROM items WHERE id = ? AND source_type = '뉴스'", (item_id,)).fetchone()
+            if item is None:
+                self.send_error(HTTPStatus.NOT_FOUND, "Article not found")
+                return
+            try:
+                self._respond_json({"blocks": load_article(item["url"])})
+            except Exception:
+                self._respond_json({"error": "본문을 가져올 수 없습니다. 아래 원문 링크에서 확인해 주세요."})
+            return
         if parsed.path == "/":
             self._respond_html(render_dashboard())
             return
@@ -127,8 +140,72 @@ def render_dashboard() -> str:
       let slideshowIndex = 0;
       let newsCategoryCycleIndex = 0;
       const newsCategoryOffsets = {};
+      let selectedNewsCard = null;
+      let articleRequest = null;
+
+      function syncNewsReader() {
+        let panel = getActivePanel();
+        if (panel?.id === "news-panel") {
+          panel = newsCategoryPanels.find((category) => category.classList.contains("is-active"));
+        }
+        const cards = Array.from(panel?.querySelectorAll(".card") || []).filter((card) => !card.hidden);
+        if (!cards.includes(selectedNewsCard)) showNewsArticle(cards[0] || null);
+      }
+
+      async function showNewsArticle(card) {
+        const reader = document.getElementById("news-reader");
+        if (!reader || (card && card === selectedNewsCard)) return;
+        articleRequest?.abort();
+        selectedNewsCard = card;
+        document.querySelectorAll(".news-list .card").forEach((item) => {
+          const selected = item === card;
+          item.classList.toggle("is-reader-selected", selected);
+          item.querySelector(".card-title-button")?.setAttribute("aria-expanded", String(selected));
+        });
+        const title = document.getElementById("news-reader-title");
+        const body = document.getElementById("news-reader-body");
+        const link = document.getElementById("news-reader-link");
+        title.textContent = card?.querySelector(".card-title-button")?.textContent || "왼쪽에서 뉴스를 선택하세요";
+        body.replaceChildren();
+        link.hidden = !card;
+        reader.setAttribute("aria-busy", "false");
+        if (!card) return;
+        link.href = card.querySelector(".item-link-button").href;
+        link.textContent = "원문 보기 · " + new URL(link.href).hostname;
+        if (card.dataset.itemKind !== "news") {
+          body.textContent = "리포트와 공시는 원문 링크에서 확인할 수 있습니다.";
+          return;
+        }
+        body.textContent = "본문을 불러오는 중입니다…";
+        reader.setAttribute("aria-busy", "true");
+        articleRequest = new AbortController();
+        try {
+          const response = await fetch("/api/article?id=" + encodeURIComponent(card.dataset.itemId), {signal: articleRequest.signal});
+          if (!response.ok) throw new Error("기사 응답 오류");
+          const result = await response.json();
+          if (selectedNewsCard !== card) return;
+          body.replaceChildren();
+          if (result.error) { body.textContent = result.error; return; }
+          for (const block of result.blocks || []) {
+            const node = document.createElement(block.type === "image" ? "img" : "p");
+            if (block.type === "image") {
+              node.src = block.url;
+              node.alt = block.alt || "기사 사진";
+              node.loading = "lazy";
+              node.referrerPolicy = "no-referrer";
+              node.addEventListener("error", () => node.replaceWith(document.createTextNode("사진을 불러올 수 없습니다.")));
+            } else { node.textContent = block.text; }
+            body.append(node);
+          }
+          reader.scrollTop = 0;
+        } catch (error) {
+          if (error.name !== "AbortError" && selectedNewsCard === card) body.textContent = "본문을 가져올 수 없습니다. 원문 링크에서 확인해 주세요.";
+        } finally {
+          if (selectedNewsCard === card) reader.setAttribute("aria-busy", "false");
+        }
+      }
       const tabCopy = {
-        "all-panel": "리포트와 공시를 시간순으로 함께 보여줍니다.",
+        "all-panel": "왼쪽에서 자료를 선택하면 오른쪽에서 뉴스 본문과 원문 링크를 확인할 수 있습니다.",
         "reports-panel": "기업, 산업, 시황, 전략, 경제 리포트를 성격별로 묶어 보여줍니다.",
         "disclosures-panel": "DART, KIND, EDGAR와 공시 성격을 구분해 한 번에 확인합니다.",
         "news-panel": "다음 뉴스와 커뮤니티 새소식을 모아 중복을 줄여 보여줍니다.",
@@ -146,6 +223,7 @@ def render_dashboard() -> str:
           panel.hidden = !active;
         });
         panelDescription.textContent = tabCopy[targetId] || "";
+        syncNewsReader();
         if (slideshowEnabled) {
           renderSlideshowFrame();
         }
@@ -165,6 +243,7 @@ def render_dashboard() -> str:
           panel.classList.toggle("is-active", active);
           panel.hidden = !active;
         });
+        syncNewsReader();
       }
 
       function getHiddenItemIds() {
@@ -212,6 +291,7 @@ def render_dashboard() -> str:
           }
         });
         updateCategoryBlocks();
+        syncNewsReader();
       }
 
       function hideItem(item) {
@@ -367,6 +447,10 @@ def render_dashboard() -> str:
         if (!card) {
           return;
         }
+        if (card.closest(".news-list")) {
+          showNewsArticle(card);
+          return;
+        }
         const scope = getExpansionScope(card);
         const wasExpanded = card.classList.contains("is-expanded");
         scope.querySelectorAll("[data-item-key]").forEach((candidate) => {
@@ -442,6 +526,7 @@ def render_dashboard() -> str:
             return;
           }
           activateNewsCategory(newsTarget.panelId);
+          showNewsArticle(newsTarget.card);
           itemCards.forEach((card) => {
             const active = card === newsTarget.card;
             card.classList.toggle("is-slideshow-current", active);
@@ -461,6 +546,7 @@ def render_dashboard() -> str:
           card.classList.toggle("is-slideshow-current", active);
           card.classList.toggle("is-slideshow-hidden", !active);
         });
+        showNewsArticle(activeCards[slideshowIndex]);
         updateCategoryBlocks();
       }
 
@@ -692,7 +778,7 @@ def render_dashboard() -> str:
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>Morning Market Dashboard</title>
-    <link rel=\"stylesheet\" href=\"/static/styles.css\" />
+    <link rel=\"stylesheet\" href=\"/static/styles.css?v=reader-2\" />
   </head>
   <body>
     <main class=\"page\">
@@ -762,9 +848,11 @@ def render_dashboard() -> str:
           </button>
         </div>
         <div class=\"panel-meta\">
-          <p id=\"panel-description\">리포트와 공시를 시간순으로 함께 보여줍니다.</p>
+          <p id=\"panel-description\">왼쪽에서 자료를 선택하면 오른쪽에서 뉴스 본문과 원문 링크를 확인할 수 있습니다.</p>
           <button type=\"button\" class=\"slideshow-toggle-button\" id=\"slideshow-toggle\" aria-pressed=\"false\">슬라이드쇼 시작</button>
         </div>
+        <div class="news-workspace">
+        <div class="news-list">
         <div class=\"tab-panel is-active\" id=\"all-panel\" role=\"tabpanel\" aria-labelledby=\"all-tab\">
           <div class=\"grid\">
             {all_cards}
@@ -784,6 +872,13 @@ def render_dashboard() -> str:
           <div class=\"grid\">
             {news_cards}
           </div>
+        </div>
+        </div>
+        <article class="news-reader" id="news-reader" aria-label="선택한 뉴스 본문" aria-busy="false">
+          <h2 id="news-reader-title">왼쪽에서 자료를 선택하세요</h2>
+          <a id="news-reader-link" target="_blank" rel="noopener noreferrer" hidden>원문 보기</a>
+          <div id="news-reader-body" aria-live="polite"></div>
+        </article>
         </div>
       </section>
     </main>
