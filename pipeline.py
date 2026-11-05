@@ -149,7 +149,7 @@ def run_pipeline(progress_callback: ProgressCallback | None = None) -> PipelineR
                 url=item.url,
                 published_at=item.published_at,
                 content=item.content,
-                summary="",
+                summary=item.summary,
                 tags=", ".join(item.tags),
             )
             stored += 1

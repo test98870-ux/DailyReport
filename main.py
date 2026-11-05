@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,7 @@ from config import load_env_file
 from db import fetch_recent_items, init_db, get_connection
 from article_reader import load_article
 from pipeline import pipeline_result_to_dict, run_pipeline
+from news_groups import group_similar
 from sources import news_collection_window_start, normalize_news_url, parse_published_datetime
 
 
@@ -38,6 +40,8 @@ JOB_STATE: dict[str, object] = {
     "source_results": [],
 }
 
+KST = timezone(timedelta(hours=9))
+
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -49,9 +53,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/article":
             item_id = parse_qs(parsed.query).get("id", [""])[0]
             with get_connection() as conn:
-                item = conn.execute("SELECT * FROM items WHERE id = ? AND source_type = '뉴스'", (item_id,)).fetchone()
+                item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
             if item is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "Article not found")
+                return
+            if item["source_type"] != "뉴스":
+                lines = [line for line in (item["summary"] or "").splitlines() if line.strip()]
+                if lines:
+                    self._respond_json({"blocks": [{"type": "lead", "text": lines[0]}] + [{"type": "text", "text": line} for line in lines[1:]]})
+                else:
+                    self._respond_json({"error": "요약이 없는 자료입니다. 원문 보기를 누르면 새 탭에서 열립니다."})
+                return
+            if urlparse(item["url"] or "").hostname in {"damoang.net", "www.damoang.net"}:
+                self._respond_json({"error": "다모앙은 자동 접속을 차단해서 본문을 불러올 수 없습니다. 원문 보기를 눌러 주세요."})
                 return
             try:
                 self._respond_json({"blocks": load_article(item["url"])})
@@ -110,8 +124,9 @@ def render_dashboard() -> str:
     reports = sort_items_by_published_desc([row for row in rows if is_report(row)])
     disclosures = sort_items_by_published_desc([row for row in rows if is_disclosure(row)])
     news_items = sort_items_by_published_desc([row for row in rows if is_news(row)])
-    spotlight_cards = render_spotlight_section(reports, disclosures, news_items)
-    all_cards = "\n".join(render_card(row) for row in rows) or render_empty("어제 16시 이후 자료가 아직 없습니다.")
+    all_card_count = len(group_news_items(rows))
+    news_card_count = len(group_news_items(news_items))
+    all_cards = render_card_list(rows) or render_empty("어제 16시 이후 자료가 아직 없습니다.")
     report_cards = render_report_sections(reports)
     disclosure_cards = render_disclosure_sections(disclosures)
     news_cards = render_news_sections(news_items)
@@ -124,6 +139,7 @@ def render_dashboard() -> str:
       const progressTitle = document.getElementById("progress-title");
       const panelDescription = document.getElementById("panel-description");
       const slideshowToggleButton = document.getElementById("slideshow-toggle");
+      const readAllButton = document.getElementById("read-all");
       const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
       const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
       const newsFilterButtons = Array.from(document.querySelectorAll(".news-filter-button"));
@@ -143,18 +159,134 @@ def render_dashboard() -> str:
       let selectedNewsCard = null;
       let articleRequest = null;
 
-      function syncNewsReader() {
+      const viewedStorageKey = "daily-report-viewed-keys";
+      const fontStorageKey = "daily-report-reader-font";
+      const fontSteps = [15, 16, 17, 18, 20, 22, 24];
+      const readerEl = document.getElementById("news-reader");
+      const readerScroll = document.getElementById("reader-scroll");
+      const readerPrev = document.getElementById("reader-prev");
+      const readerNext = document.getElementById("reader-next");
+      const readerDone = document.getElementById("reader-done");
+      const readerSidePrev = document.getElementById("reader-side-prev");
+      const readerSideNext = document.getElementById("reader-side-next");
+      const readerSideDone = document.getElementById("reader-side-done");
+      let viewedKeys = new Set(readStoredList(viewedStorageKey));
+      let fontIndex = fontSteps.indexOf(Number(readStoredValue(fontStorageKey)));
+      if (fontIndex < 0) fontIndex = 2;
+
+      function readStoredValue(key) {
+        try { return window.localStorage.getItem(key); } catch (_error) { return null; }
+      }
+
+      function readStoredList(key) {
+        try {
+          const parsed = JSON.parse(window.localStorage.getItem(key) || "[]");
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (_error) {
+          return [];
+        }
+      }
+
+      function writeStored(key, value) {
+        try { window.localStorage.setItem(key, value); } catch (_error) { /* storage unavailable */ }
+      }
+
+      function applyFontSize() {
+        readerEl.style.setProperty("--reader-font", fontSteps[fontIndex] + "px");
+        writeStored(fontStorageKey, String(fontSteps[fontIndex]));
+      }
+
+      function renderViewed() {
+        itemCards.forEach((card) => card.classList.toggle("is-viewed", viewedKeys.has(card.dataset.itemKey)));
+      }
+
+      function markViewed(card) {
+        if (!card || viewedKeys.has(card.dataset.itemKey)) return;
+        viewedKeys.add(card.dataset.itemKey);
+        viewedKeys = new Set(Array.from(viewedKeys).slice(-3000));
+        writeStored(viewedStorageKey, JSON.stringify(Array.from(viewedKeys)));
+        renderViewed();
+      }
+
+      function getReaderCards() {
         let panel = getActivePanel();
         if (panel?.id === "news-panel") {
           panel = newsCategoryPanels.find((category) => category.classList.contains("is-active"));
         }
-        const cards = Array.from(panel?.querySelectorAll(".card") || []).filter((card) => !card.hidden);
-        if (!cards.includes(selectedNewsCard)) showNewsArticle(cards[0] || null);
+        return Array.from(panel?.querySelectorAll("[data-item-key]") || []).filter((card) => !card.hidden);
       }
 
-      async function showNewsArticle(card) {
-        const reader = document.getElementById("news-reader");
-        if (!reader || (card && card === selectedNewsCard)) return;
+      function updateReaderNav() {
+        const cards = getReaderCards();
+        const index = cards.indexOf(selectedNewsCard);
+        readerPrev.disabled = index <= 0;
+        readerNext.disabled = index < 0 || index >= cards.length - 1;
+        readerSidePrev.disabled = readerPrev.disabled;
+        readerSideNext.disabled = readerNext.disabled;
+        readerSideDone.disabled = !selectedNewsCard;
+        readerDone.disabled = !selectedNewsCard;
+      }
+
+      function syncNewsReader() {
+        const cards = getReaderCards();
+        if (!cards.includes(selectedNewsCard)) showNewsArticle(cards[0] || null);
+        updateReaderNav();
+      }
+
+      function moveReader(offset) {
+        const cards = getReaderCards();
+        if (!cards.length) return;
+        const index = cards.indexOf(selectedNewsCard);
+        const target = cards[Math.min(cards.length - 1, Math.max(0, index < 0 ? 0 : index + offset))];
+        if (target && target !== selectedNewsCard) showNewsArticle(target, { reveal: true });
+      }
+
+      function markReadAndNext() {
+        const card = selectedNewsCard;
+        if (!card) return;
+        const cards = getReaderCards();
+        const index = cards.indexOf(card);
+        const next = cards[index + 1] || cards[index - 1] || null;
+        if (next) showNewsArticle(next, { reveal: true });
+        hideItem(card);
+      }
+
+      function renderLoading(body) {
+        body.replaceChildren();
+        body.classList.add("is-loading");
+        [92, 100, 84, 96, 70].forEach((width) => {
+          const line = document.createElement("span");
+          line.className = "skeleton-line";
+          line.style.width = width + "%";
+          body.append(line);
+        });
+      }
+
+      function renderNotice(body, message) {
+        body.classList.remove("is-loading");
+        const note = document.createElement("p");
+        note.className = "reader-notice";
+        note.textContent = message;
+        body.replaceChildren(note);
+      }
+
+      function readerInfo(element) {
+        return {
+          id: element.dataset.itemId,
+          title: element.dataset.title || element.querySelector(".card-title-button")?.textContent.trim() || "",
+          meta: [element.dataset.kindLabel, element.dataset.category, element.dataset.source, element.dataset.time].filter(Boolean).join(" · "),
+          url: element.dataset.url || element.querySelector(".item-link-button")?.href || "",
+        };
+      }
+
+      function showSimilarArticle(button) {
+        const card = button.closest("[data-item-key]");
+        if (!card) return;
+        showNewsArticle(card, { info: readerInfo(button), focusReader: true, similar: button });
+      }
+
+      async function showNewsArticle(card, options = {}) {
+        if (!readerEl || (card && card === selectedNewsCard && !options.info)) return;
         articleRequest?.abort();
         selectedNewsCard = card;
         document.querySelectorAll(".news-list .card").forEach((item) => {
@@ -162,53 +294,92 @@ def render_dashboard() -> str:
           item.classList.toggle("is-reader-selected", selected);
           item.querySelector(".card-title-button")?.setAttribute("aria-expanded", String(selected));
         });
+        document.querySelectorAll(".similar-item.is-active").forEach((item) => item.classList.remove("is-active"));
+        options.similar?.classList.add("is-active");
+        const info = options.info || (card ? readerInfo(card) : null);
         const title = document.getElementById("news-reader-title");
+        const meta = document.getElementById("news-reader-meta");
         const body = document.getElementById("news-reader-body");
         const link = document.getElementById("news-reader-link");
-        title.textContent = card?.querySelector(".card-title-button")?.textContent || "왼쪽에서 뉴스를 선택하세요";
+        readerEl.classList.toggle("is-empty", !card);
+        title.textContent = info?.title || "왼쪽 목록에서 자료를 선택하세요";
+        meta.textContent = info?.meta || "";
         body.replaceChildren();
+        body.classList.remove("is-loading");
         link.hidden = !card;
-        reader.setAttribute("aria-busy", "false");
+        readerEl.setAttribute("aria-busy", "false");
+        readerScroll.scrollTop = 0;
+        updateReaderNav();
         if (!card) return;
-        link.href = card.querySelector(".item-link-button").href;
-        link.textContent = "원문 보기 · " + new URL(link.href).hostname;
-        if (card.dataset.itemKind !== "news") {
-          body.textContent = "리포트와 공시는 원문 링크에서 확인할 수 있습니다.";
-          return;
+        markViewed(card);
+        if (options.reveal) card.scrollIntoView({ block: "nearest" });
+        if (options.focusReader && window.matchMedia("(max-width: 900px)").matches) {
+          readerEl.scrollIntoView({ behavior: "smooth", block: "start" });
         }
-        body.textContent = "본문을 불러오는 중입니다…";
-        reader.setAttribute("aria-busy", "true");
-        articleRequest = new AbortController();
+        link.href = info.url;
+        try { link.textContent = "원문 보기 · " + new URL(link.href).hostname.replace("www.", ""); } catch (_error) { link.textContent = "원문 보기"; }
+        renderLoading(body);
+        readerEl.setAttribute("aria-busy", "true");
+        const request = new AbortController();
+        articleRequest = request;
         try {
-          const response = await fetch("/api/article?id=" + encodeURIComponent(card.dataset.itemId), {signal: articleRequest.signal});
+          const response = await fetch("/api/article?id=" + encodeURIComponent(info.id), {signal: request.signal});
           if (!response.ok) throw new Error("기사 응답 오류");
           const result = await response.json();
-          if (selectedNewsCard !== card) return;
+          if (articleRequest !== request) return;
+          body.classList.remove("is-loading");
           body.replaceChildren();
-          if (result.error) { body.textContent = result.error; return; }
+          if (result.error) { renderNotice(body, result.error); return; }
           for (const block of result.blocks || []) {
-            const node = document.createElement(block.type === "image" ? "img" : "p");
             if (block.type === "image") {
+              const figure = document.createElement("figure");
+              const node = document.createElement("img");
               node.src = block.url;
               node.alt = block.alt || "기사 사진";
               node.loading = "lazy";
               node.referrerPolicy = "no-referrer";
-              node.addEventListener("error", () => node.replaceWith(document.createTextNode("사진을 불러올 수 없습니다.")));
-            } else { node.textContent = block.text; }
-            body.append(node);
+              node.addEventListener("error", () => figure.remove());
+              figure.append(node);
+              body.append(figure);
+            } else {
+              const node = document.createElement("p");
+              node.textContent = block.text;
+              if (block.type === "lead") node.className = "reader-lead";
+              body.append(node);
+            }
           }
-          reader.scrollTop = 0;
         } catch (error) {
-          if (error.name !== "AbortError" && selectedNewsCard === card) body.textContent = "본문을 가져올 수 없습니다. 원문 링크에서 확인해 주세요.";
+          if (error.name !== "AbortError" && articleRequest === request) renderNotice(body, "본문을 가져올 수 없습니다. 원문 링크에서 확인해 주세요.");
         } finally {
-          if (selectedNewsCard === card) reader.setAttribute("aria-busy", "false");
+          if (articleRequest === request) readerEl.setAttribute("aria-busy", "false");
         }
       }
+
+      readerPrev.addEventListener("click", () => moveReader(-1));
+      readerNext.addEventListener("click", () => moveReader(1));
+      readerSidePrev.addEventListener("click", () => moveReader(-1));
+      readerSideNext.addEventListener("click", () => moveReader(1));
+      readerSideDone.addEventListener("click", () => markReadAndNext());
+      readerDone.addEventListener("click", markReadAndNext);
+      document.getElementById("reader-font-down").addEventListener("click", () => { fontIndex = Math.max(0, fontIndex - 1); applyFontSize(); });
+      document.getElementById("reader-font-up").addEventListener("click", () => { fontIndex = Math.min(fontSteps.length - 1, fontIndex + 1); applyFontSize(); });
+      document.getElementById("reader-back").addEventListener("click", () => {
+        (selectedNewsCard || document.getElementById("news-list")).scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.ctrlKey || event.metaKey || event.altKey || event.target.closest?.("input, textarea, select, [contenteditable]")) return;
+        if (event.key === "j") moveReader(1);
+        else if (event.key === "k") moveReader(-1);
+        else if (event.key === "x") markReadAndNext();
+        else if (event.key === "o" && selectedNewsCard) window.open(document.getElementById("news-reader-link").href, "_blank", "noopener");
+        else return;
+        event.preventDefault();
+      });
       const tabCopy = {
-        "all-panel": "왼쪽에서 자료를 선택하면 오른쪽에서 뉴스 본문과 원문 링크를 확인할 수 있습니다.",
-        "reports-panel": "기업, 산업, 시황, 전략, 경제 리포트를 성격별로 묶어 보여줍니다.",
-        "disclosures-panel": "DART, KIND, EDGAR와 공시 성격을 구분해 한 번에 확인합니다.",
-        "news-panel": "다음 뉴스와 커뮤니티 새소식을 모아 중복을 줄여 보여줍니다.",
+        "all-panel": "리포트·공시·뉴스를 시간순으로 보여줍니다.",
+        "reports-panel": "기업·산업·시황·전략·경제 리포트를 묶어 보여줍니다.",
+        "disclosures-panel": "DART·KIND·EDGAR 공시를 성격별로 보여줍니다.",
+        "news-panel": "카테고리를 고르면 기사 본문을 오른쪽에서 바로 읽을 수 있습니다.",
       };
 
       function activateTab(targetId) {
@@ -258,8 +429,26 @@ def render_dashboard() -> str:
       }
 
       function setHiddenItemIds(ids) {
-        window.localStorage.setItem(hiddenItemsStorageKey, JSON.stringify(Array.from(new Set(ids))));
-        window.localStorage.removeItem(hiddenItemsResetAtStorageKey);
+        try {
+          window.localStorage.setItem(hiddenItemsStorageKey, JSON.stringify(Array.from(new Set(ids))));
+          window.localStorage.removeItem(hiddenItemsResetAtStorageKey);
+        } catch (_error) {
+          // Storage full or unavailable: keep the page usable.
+        }
+      }
+
+      function pruneHiddenItemIds() {
+        // Drop keys of items no longer on the page so storage does not grow without bound.
+        // Skip when the page is empty so a failed load does not wipe the read history.
+        if (!itemCards.length) {
+          return;
+        }
+        const currentKeys = new Set(itemCards.flatMap((card) => getItemReadKeys(card)));
+        const hiddenIds = getHiddenItemIds();
+        const keptIds = hiddenIds.filter((itemKey) => currentKeys.has(itemKey));
+        if (keptIds.length !== hiddenIds.length) {
+          setHiddenItemIds(keptIds);
+        }
       }
 
       function getItemReadKeys(card) {
@@ -364,6 +553,44 @@ def render_dashboard() -> str:
         }
       }
 
+      let readAllConfirmTimer = null;
+
+      function resetReadAllButton() {
+        clearTimeout(readAllConfirmTimer);
+        readAllConfirmTimer = null;
+        readAllButton.classList.remove("is-confirming");
+        readAllButton.textContent = "모두 읽음";
+      }
+
+      function hideAllActivePanelItems() {
+        const activePanel = getActivePanel();
+        const cards = activePanel ? Array.from(activePanel.querySelectorAll("[data-item-key]")).filter((card) => !card.hidden) : [];
+        if (!cards.length) {
+          resetReadAllButton();
+          return;
+        }
+        if (!readAllConfirmTimer) {
+          readAllButton.classList.add("is-confirming");
+          readAllButton.textContent = `한 번 더 누르면 ${cards.length}건 숨김`;
+          readAllConfirmTimer = setTimeout(resetReadAllButton, 3000);
+          return;
+        }
+        resetReadAllButton();
+        const nextIds = new Set(getHiddenItemIds());
+        cards.forEach((card) => {
+          getItemReadKeys(card).forEach((itemKey) => nextIds.add(itemKey));
+          card.classList.remove("is-expanded");
+          card.querySelector(".card-title-button")?.setAttribute("aria-expanded", "false");
+        });
+        setHiddenItemIds(Array.from(nextIds));
+        clearNewsNavigation(activePanel);
+        renderItemVisibility();
+        ensureActiveNewsCategory();
+        if (slideshowEnabled) {
+          refreshSlideshow();
+        }
+      }
+
       function getVisibleNewsButtons() {
         return newsFilterButtons.filter((button) => {
           const panel = document.getElementById(button.dataset.newsTarget || "");
@@ -448,7 +675,7 @@ def render_dashboard() -> str:
           return;
         }
         if (card.closest(".news-list")) {
-          showNewsArticle(card);
+          showNewsArticle(card, { focusReader: true });
           return;
         }
         const scope = getExpansionScope(card);
@@ -558,7 +785,7 @@ def render_dashboard() -> str:
       }
 
       function syncSlideshowButton() {
-        slideshowToggleButton.textContent = slideshowEnabled ? "슬라이드쇼 중지" : "슬라이드쇼 시작";
+        slideshowToggleButton.textContent = slideshowEnabled ? "슬라이드쇼 중지" : "슬라이드쇼";
         slideshowToggleButton.setAttribute("aria-pressed", String(slideshowEnabled));
       }
 
@@ -732,12 +959,27 @@ def render_dashboard() -> str:
         if (!(event.target instanceof Element)) {
           return;
         }
-        const button = event.target.closest(".category-read-button, .card-title-button, .item-hide-button, #slideshow-toggle");
+        const button = event.target.closest(".category-read-button, .card-title-button, .item-hide-button, #slideshow-toggle, #read-all");
+        const similarButton = event.target.closest(".similar-item");
+        if (similarButton) {
+          event.preventDefault();
+          showSimilarArticle(similarButton);
+          return;
+        }
         if (!button) {
+          const listCard = event.target.closest(".news-list .card");
+          if (listCard && !event.target.closest("a, button, summary")) {
+            showNewsArticle(listCard, { focusReader: true });
+          }
           return;
         }
         event.preventDefault();
         button.blur();
+
+        if (button.id === "read-all") {
+          hideAllActivePanelItems();
+          return;
+        }
 
         if (button.id === "slideshow-toggle") {
           slideshowEnabled = !slideshowEnabled;
@@ -766,122 +1008,108 @@ def render_dashboard() -> str:
         }
       });
 
+      applyFontSize();
+      renderViewed();
+      pruneHiddenItemIds();
       renderItemVisibility();
       ensureActiveNewsCategory();
       refreshSlideshow();
       pollStatus();
     </script>
     """
+    window_start = news_collection_window_start().astimezone(KST)
+    window_label = f"{window_start.month}/{window_start.day} {window_start:%H:%M} 이후"
     return f"""<!doctype html>
 <html lang=\"ko\">
   <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>Morning Market Dashboard</title>
-    <link rel=\"stylesheet\" href=\"/static/styles.css?v=reader-2\" />
+    <title>Morning Market</title>
+    <link rel=\"stylesheet\" href=\"/static/styles.css?v=reader-6\" />
   </head>
   <body>
-    <main class=\"page\">
-      <section class=\"hero\">
-        <div>
-          <p class=\"eyebrow\">AI Morning Briefing</p>
-          <h1>어제 16시 이후 리포트, 공시, 뉴스를<br />읽지 않은 것만 골라 봅니다.</h1>
-          <p class=\"lead\">
-            시장 리포트와 공식 공시, 주요 뉴스를 한곳에 모으되 길게 쌓이지 않도록 전환형 대시보드로 정리했습니다.
-          </p>
+    <div class=\"app\">
+      <header class=\"topbar\">
+        <div class=\"brand\">
+          <strong>Morning Market</strong>
+          <span>{html.escape(window_label)}</span>
         </div>
+        <nav class=\"tab-bar\" role=\"tablist\" aria-label=\"자료 보기 전환\">
+          <button type=\"button\" class=\"tab-button is-active\" data-tab-target=\"all-panel\" id=\"all-tab\" role=\"tab\" aria-selected=\"true\" aria-controls=\"all-panel\">전체 <span>{all_card_count}</span></button>
+          <button type=\"button\" class=\"tab-button\" data-tab-target=\"news-panel\" id=\"news-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"news-panel\">뉴스 <span>{news_card_count}</span></button>
+          <button type=\"button\" class=\"tab-button\" data-tab-target=\"reports-panel\" id=\"reports-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"reports-panel\">리포트 <span>{len(reports)}</span></button>
+          <button type=\"button\" class=\"tab-button\" data-tab-target=\"disclosures-panel\" id=\"disclosures-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"disclosures-panel\">공시 <span>{len(disclosures)}</span></button>
+        </nav>
         <form id=\"run-form\" class=\"run-form\">
-          <button type=\"submit\">지금 수집 실행</button>
-          <p id=\"status-text\">서버가 시작되면 즉시 수집하고, 이후 3시간마다 자동으로 갱신합니다.</p>
-          <div class=\"progress-panel\" id=\"progress-panel\">
-            <div class=\"progress-bar\">
-              <div class=\"progress-fill\" id=\"progress-fill\"></div>
-            </div>
-            <p class=\"progress-meta\" id=\"progress-meta\">진행 대기 중</p>
-            <p class=\"progress-title\" id=\"progress-title\"></p>
-            <details>
-              <summary>소스별 수집 결과</summary>
+          <details class=\"status-details\">
+            <summary>
+              <span class=\"progress-bar\"><span class=\"progress-fill\" id=\"progress-fill\"></span></span>
+              <span id=\"status-text\">3시간마다 자동 수집</span>
+            </summary>
+            <div class=\"status-popover\">
+              <p class=\"progress-meta\" id=\"progress-meta\">진행 대기 중</p>
+              <p class=\"progress-title\" id=\"progress-title\"></p>
               <ul id=\"source-results\"></ul>
-            </details>
-          </div>
-          <div class=\"hero-stats\">
-            <div class=\"stat-box\">
-              <strong>{len(reports)}</strong>
-              <span>리포트</span>
             </div>
-            <div class=\"stat-box\">
-              <strong>{len(disclosures)}</strong>
-              <span>공시</span>
-            </div>
-            <div class=\"stat-box\">
-              <strong>{len(news_items)}</strong>
-              <span>뉴스</span>
-            </div>
-          </div>
+          </details>
+          <button type=\"submit\" class=\"run-button\">지금 수집</button>
         </form>
-      </section>
-      {spotlight_cards}
-      <section class=\"section-block content-switcher\">
-        <div class=\"section-head section-head-tabs\">
-          <div>
-            <p class=\"eyebrow\">View</p>
-            <h2>탭으로 전환해 읽기</h2>
+      </header>
+      <div class=\"workspace\">
+        <section class=\"list-pane\" aria-label=\"자료 목록\">
+          <div class=\"panel-meta\">
+            <p id=\"panel-description\">리포트·공시·뉴스를 시간순으로 보여줍니다.</p>
+            <div class=\"panel-actions\">
+              <button type=\"button\" class=\"read-all-button\" id=\"read-all\">모두 읽음</button>
+              <button type=\"button\" class=\"slideshow-toggle-button\" id=\"slideshow-toggle\" aria-pressed=\"false\">슬라이드쇼</button>
+            </div>
           </div>
-          <p class=\"section-copy\">전체 흐름을 먼저 보고, 리포트나 공시만 따로 좁혀 읽을 수 있습니다.</p>
-        </div>
-        <div class=\"tab-bar\" role=\"tablist\" aria-label=\"자료 보기 전환\">
-          <button type=\"button\" class=\"tab-button is-active\" data-tab-target=\"all-panel\" id=\"all-tab\" role=\"tab\" aria-selected=\"true\" aria-controls=\"all-panel\">
-            전체
-            <span>{len(rows)}</span>
-          </button>
-          <button type=\"button\" class=\"tab-button\" data-tab-target=\"reports-panel\" id=\"reports-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"reports-panel\">
-            리포트
-            <span>{len(reports)}</span>
-          </button>
-          <button type=\"button\" class=\"tab-button\" data-tab-target=\"disclosures-panel\" id=\"disclosures-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"disclosures-panel\">
-            공시
-            <span>{len(disclosures)}</span>
-          </button>
-          <button type=\"button\" class=\"tab-button\" data-tab-target=\"news-panel\" id=\"news-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"news-panel\">
-            뉴스
-            <span>{len(news_items)}</span>
-          </button>
-        </div>
-        <div class=\"panel-meta\">
-          <p id=\"panel-description\">왼쪽에서 자료를 선택하면 오른쪽에서 뉴스 본문과 원문 링크를 확인할 수 있습니다.</p>
-          <button type=\"button\" class=\"slideshow-toggle-button\" id=\"slideshow-toggle\" aria-pressed=\"false\">슬라이드쇼 시작</button>
-        </div>
-        <div class="news-workspace">
-        <div class="news-list">
-        <div class=\"tab-panel is-active\" id=\"all-panel\" role=\"tabpanel\" aria-labelledby=\"all-tab\">
-          <div class=\"grid\">
-            {all_cards}
+          <div class=\"news-list\" id=\"news-list\">
+            <div class=\"tab-panel is-active\" id=\"all-panel\" role=\"tabpanel\" aria-labelledby=\"all-tab\">
+              <div class=\"grid\">
+                {all_cards}
+              </div>
+            </div>
+            <div class=\"tab-panel\" id=\"news-panel\" role=\"tabpanel\" aria-labelledby=\"news-tab\" hidden>
+              {news_cards}
+            </div>
+            <div class=\"tab-panel\" id=\"reports-panel\" role=\"tabpanel\" aria-labelledby=\"reports-tab\" hidden>
+              {report_cards}
+            </div>
+            <div class=\"tab-panel\" id=\"disclosures-panel\" role=\"tabpanel\" aria-labelledby=\"disclosures-tab\" hidden>
+              {disclosure_cards}
+            </div>
           </div>
-        </div>
-        <div class=\"tab-panel\" id=\"reports-panel\" role=\"tabpanel\" aria-labelledby=\"reports-tab\" hidden>
-          <div class=\"grid\">
-            {report_cards}
+        </section>
+        <article class=\"news-reader\" id=\"news-reader\" aria-label=\"선택한 자료 본문\" aria-busy=\"false\">
+          <div class=\"reader-toolbar\">
+            <button type=\"button\" class=\"reader-back\" id=\"reader-back\">← 목록</button>
+            <div class=\"reader-nav\">
+              <button type=\"button\" id=\"reader-prev\" title=\"이전 (k, ↑)\">↑ 이전</button>
+              <button type=\"button\" id=\"reader-next\" title=\"다음 (j, ↓)\">다음 ↓</button>
+              <button type=\"button\" id=\"reader-done\" class=\"reader-done\" title=\"읽음 처리 후 다음 (x)\">읽음 · 다음</button>
+            </div>
+            <div class=\"reader-font\" role=\"group\" aria-label=\"글자 크기\">
+              <button type=\"button\" id=\"reader-font-down\" aria-label=\"글자 작게\">가−</button>
+              <button type=\"button\" id=\"reader-font-up\" aria-label=\"글자 크게\">가+</button>
+            </div>
           </div>
-        </div>
-        <div class=\"tab-panel\" id=\"disclosures-panel\" role=\"tabpanel\" aria-labelledby=\"disclosures-tab\" hidden>
-          <div class=\"grid\">
-            {disclosure_cards}
+          <div class=\"reader-side-nav\" role=\"group\" aria-label=\"이전·다음 자료\">
+            <button type=\"button\" id=\"reader-side-prev\" title=\"이전 (k)\" aria-label=\"이전 자료\">↑</button>
+            <button type=\"button\" id=\"reader-side-next\" title=\"다음 (j)\" aria-label=\"다음 자료\">↓</button>
+            <button type=\"button\" id=\"reader-side-done\" class=\"reader-side-done\" title=\"읽음 처리 후 다음 (x)\" aria-label=\"읽음 처리 후 다음\">✓</button>
           </div>
-        </div>
-        <div class=\"tab-panel\" id=\"news-panel\" role=\"tabpanel\" aria-labelledby=\"news-tab\" hidden>
-          <div class=\"grid\">
-            {news_cards}
+          <div class=\"reader-scroll\" id=\"reader-scroll\">
+            <div class=\"reader-inner\">
+              <p class=\"reader-meta\" id=\"news-reader-meta\"></p>
+              <h1 id=\"news-reader-title\">왼쪽 목록에서 자료를 선택하세요</h1>
+              <a id=\"news-reader-link\" class=\"reader-link\" target=\"_blank\" rel=\"noopener noreferrer\" hidden>원문 보기</a>
+              <div id=\"news-reader-body\" aria-live=\"polite\"></div>
+            </div>
           </div>
-        </div>
-        </div>
-        <article class="news-reader" id="news-reader" aria-label="선택한 뉴스 본문" aria-busy="false">
-          <h2 id="news-reader-title">왼쪽에서 자료를 선택하세요</h2>
-          <a id="news-reader-link" target="_blank" rel="noopener noreferrer" hidden>원문 보기</a>
-          <div id="news-reader-body" aria-live="polite"></div>
         </article>
-        </div>
-      </section>
-    </main>
+      </div>
+    </div>
     {script}
   </body>
 </html>"""
@@ -909,6 +1137,18 @@ def published_sort_value(item: dict[str, str]) -> datetime:
     return published_at.astimezone(timezone.utc)
 
 
+def format_published_label(item: dict[str, str]) -> str:
+    value = published_sort_value(item)
+    if value.year <= 1:
+        return ""
+    local = value.astimezone(KST)
+    if local.hour == local.minute == local.second == 0 and not is_news(item):
+        return f"{local.month}/{local.day}"
+    if local.date() == datetime.now(KST).date():
+        return f"{local:%H:%M}"
+    return f"{local.month}/{local.day} {local:%H:%M}"
+
+
 def sort_items_by_published_desc(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(items, key=published_sort_value, reverse=True)
 
@@ -919,6 +1159,8 @@ def get_news_category(item: dict[str, str]) -> str:
         return source_name.removeprefix("네이버 뉴스 ").strip() or "뉴스"
     if "다음 뉴스 " in source_name:
         return source_name.removeprefix("다음 뉴스 ").strip() or "뉴스"
+    if "다모앙 " in source_name:
+        return source_name.removeprefix("다모앙 ").strip() or "커뮤니티"
     if "클리앙" in source_name or "다모앙" in source_name:
         return "커뮤니티"
     tags = [part.strip() for part in item.get("tags", "").split(",") if part.strip()]
@@ -1032,6 +1274,8 @@ def get_report_category(item: dict[str, str]) -> str:
         return "전략"
     if "경제분석" in source_name:
         return "경제"
+    if "채권분석" in source_name:
+        return "채권"
     if "한경 컨센서스" in source_name:
         tags = [part.strip() for part in item.get("tags", "").split(",") if part.strip()]
         return tags[0] if tags else "컨센서스"
@@ -1101,7 +1345,7 @@ def render_report_sections(items: list[dict[str, str]]) -> str:
     return render_grouped_sections(
         items,
         empty_message="리포트가 아직 없습니다.",
-        category_order=["기업", "산업", "시황", "전략", "경제", "컨센서스", "기타 리포트"],
+        category_order=["기업", "산업", "시황", "전략", "경제", "채권", "컨센서스", "기타 리포트"],
         category_getter=get_report_category,
         block_class="category-block report-category-block",
     )
@@ -1136,6 +1380,7 @@ def render_news_sections(items: list[dict[str, str]]) -> str:
         "지식/칼럼",
         "연재",
         "커뮤니티",
+        "주식한당",
         "기타",
     ]
     grouped: dict[str, list[dict[str, str]]] = {}
@@ -1157,9 +1402,10 @@ def render_news_sections(items: list[dict[str, str]]) -> str:
     buttons = []
     panels = []
     for category in ordered_categories:
-        category_items = sort_items_by_published_desc(grouped[category])
+        category_groups = group_news_items(sort_items_by_published_desc(grouped[category]))
+        category_items = [group[0] for group in category_groups]
         category_id = category.replace("/", "-").replace(" ", "-")
-        cards = "\n".join(render_card(item) for item in category_items)
+        cards = "\n".join(render_card(group[0], group[1:]) for group in category_groups)
         is_active = category == first_category
         buttons.append(
             f"""
@@ -1210,7 +1456,43 @@ def render_empty(message: str) -> str:
     """
 
 
-def render_card(item: dict[str, str]) -> str:
+def group_news_items(items: list[dict[str, str]]) -> list[list[dict[str, str]]]:
+    return group_similar(items, title=lambda item: item.get("title", ""), published=published_sort_value, groupable=is_news)
+
+
+def render_card_list(items: list[dict[str, str]]) -> str:
+    return "\n".join(render_card(group[0], group[1:]) for group in group_news_items(items))
+
+
+def card_source_label(item: dict[str, str]) -> str:
+    source_name = item.get("source_name", "")
+    for prefix in ("다음 뉴스", "네이버 뉴스"):
+        if source_name.startswith(prefix):
+            return prefix
+    return source_name
+
+
+def render_similar_items(similar: list[dict[str, str]]) -> str:
+    if not similar:
+        return ""
+    entries = []
+    for item in similar:
+        time_label = html.escape(format_published_label(item))
+        entries.append(
+            f"""<li><button type=\"button\" class=\"similar-item\" data-item-id=\"{html.escape(str(item.get('id', '')))}\""""
+            f""" data-kind-label=\"뉴스\" data-category=\"{html.escape(get_news_category(item))}\" data-source=\"{html.escape(card_source_label(item))}\""""
+            f""" data-time=\"{time_label}\" data-url=\"{html.escape(item.get('url') or '#')}\" data-title=\"{html.escape(item['title'])}\">"""
+            f"""<span>{html.escape(item['title'])}</span><time>{time_label}</time></button></li>"""
+        )
+    return f"""
+        <details class=\"card-similar\">
+          <summary>비슷한 기사 {len(similar)}건</summary>
+          <ul>{''.join(entries)}</ul>
+        </details>"""
+
+
+def render_card(item: dict[str, str], similar: list[dict[str, str]] | None = None) -> str:
+    similar = similar or []
     if is_disclosure(item):
         card_class = "card is-disclosure"
     elif is_news(item):
@@ -1221,9 +1503,23 @@ def render_card(item: dict[str, str]) -> str:
     link = item.get("url") or "#"
     item_id = html.escape(str(item.get("id", "")))
     item_key = html.escape(canonical_item_key(item))
-    item_keys = html.escape(json.dumps(item_read_keys(item), ensure_ascii=False))
+    read_keys = item_read_keys(item)
+    for other in similar:
+        read_keys += [key for key in [canonical_item_key(other), *item_read_keys(other)] if key not in read_keys]
+    item_keys = html.escape(json.dumps(read_keys, ensure_ascii=False))
     item_kind = "news" if is_news(item) else "disclosure" if is_disclosure(item) else "report"
-    item_attrs = f' data-item-id="{item_id}" data-item-key="{item_key}" data-item-read-keys="{item_keys}" data-item-kind="{item_kind}"'
+    if item_kind == "news":
+        kind_label, category = "뉴스", get_news_category(item)
+    elif item_kind == "disclosure":
+        kind_label, category = "공시", get_disclosure_category(item)
+    else:
+        kind_label, category = "리포트", get_report_category(item)
+    source = html.escape(card_source_label(item))
+    time_label = html.escape(format_published_label(item))
+    item_attrs = (
+        f' data-item-id="{item_id}" data-item-key="{item_key}" data-item-read-keys="{item_keys}" data-item-kind="{item_kind}"'
+        f' data-kind-label="{kind_label}" data-category="{html.escape(category)}" data-source="{source}" data-time="{time_label}"'
+    )
     hide_button = """
         <button type="button" class="item-hide-button" aria-label="읽은 항목 숨기기">읽음</button>
     """
@@ -1238,6 +1534,7 @@ def render_card(item: dict[str, str]) -> str:
           </h3>
           {hide_button}
         </div>
+        <p class=\"card-meta\"><span class=\"card-kind\">{html.escape(category)}</span><span>{source}</span><time>{time_label}</time></p>{render_similar_items(similar)}
         <div class=\"item-original-row\">
           {link_button}
         </div>
@@ -1324,9 +1621,11 @@ def start_auto_collection_scheduler() -> None:
 def main() -> None:
     load_env_file()
     init_db()
-    start_auto_collection_scheduler()
-    server = ReusableThreadingHTTPServer(("127.0.0.1", 8000), DashboardHandler)
-    print("Dashboard running on http://127.0.0.1:8000")
+    if os.environ.get("DAILY_REPORT_AUTO_COLLECT", "1") != "0":
+        start_auto_collection_scheduler()
+    port = int(os.environ.get("DAILY_REPORT_PORT", "8000"))
+    server = ReusableThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
+    print(f"Dashboard running on http://127.0.0.1:{port}")
     server.serve_forever()
 
 
