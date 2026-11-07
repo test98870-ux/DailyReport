@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import html
 import json
 import re
@@ -69,8 +70,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._respond_json(get_job_state())
             return
         if parsed.path.startswith("/static/"):
-            asset_path = STATIC_DIR / parsed.path.removeprefix("/static/")
-            if asset_path.exists():
+            asset_path = (STATIC_DIR / parsed.path.removeprefix("/static/")).resolve()
+            if asset_path.is_relative_to(STATIC_DIR.resolve()) and asset_path.is_file():
                 content_type = "text/css; charset=utf-8" if asset_path.suffix == ".css" else "text/plain"
                 self._respond_bytes(asset_path.read_bytes(), content_type)
                 return
@@ -1322,11 +1323,15 @@ def start_auto_collection_scheduler() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="DailyReport 웹 서버")
+    parser.add_argument("--host", default="127.0.0.1", help="접속 허용 주소 (기본: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="서버 포트 (기본: 8000)")
+    args = parser.parse_args()
     load_env_file()
     init_db()
+    server = ReusableThreadingHTTPServer((args.host, args.port), DashboardHandler)
     start_auto_collection_scheduler()
-    server = ReusableThreadingHTTPServer(("127.0.0.1", 8000), DashboardHandler)
-    print("Dashboard running on http://127.0.0.1:8000")
+    print(f"Dashboard listening on {args.host}:{args.port}")
     server.serve_forever()
 
 

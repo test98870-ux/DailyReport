@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 daily_report.db
+android/.gradle/
+android/**/build/
+android/local.properties
+android/*.jks
+android/*.keystore
+artifacts/

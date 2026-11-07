@@ -429,9 +429,12 @@ class NaverResearchSource(Source):
         self.source_type = source_type
         self.limit = limit
         self.include_item_name = include_item_name
+        self.within_hours: int | None = 24
 
     def fetch(self) -> list[SourceItem]:
         listing_html = fetch_text(urljoin(NAVER_FINANCE_BASE, self.list_path), encoding="euc-kr")
+        if '/_next/static/' in listing_html and not self._extract_detail_path(listing_html):
+            return self._fetch_current_api()
         rows = re.findall(r"<tr>(.*?)</tr>", listing_html, flags=re.S)
         items: list[SourceItem] = []
         for row_html in rows:
@@ -444,7 +447,7 @@ class NaverResearchSource(Source):
             if not title or not broker or not published_at_raw:
                 continue
             published_at = parse_naver_date(published_at_raw)
-            if not within_last_hours(published_at, 24):
+            if self.within_hours is not None and not within_last_hours(published_at, self.within_hours):
                 break
             item_name = self._extract_item_name(row_html)
             detail_url = urljoin(NAVER_FINANCE_BASE, detail_path)
@@ -464,6 +467,45 @@ class NaverResearchSource(Source):
                     tags=tags,
                 )
             )
+            if len(items) >= self.limit:
+                break
+        return items
+
+    def _fetch_current_api(self) -> list[SourceItem]:
+        # Npay's current official research UI loads these public JSON lists.
+        category = self.list_path.removesuffix('_list.naver')
+        category = 'market' if category == 'market_info' else category
+        if category not in {'company', 'industry', 'invest', 'economy', 'market'}:
+            raise ValueError('지원하지 않는 네이버 리서치 카테고리입니다.')
+        page = 'daily' if category == 'market' else category
+        url = f'https://stock.naver.com/api/stockSecurity/researches/v2/{category}?index=0&size={max(15, min(self.limit, 100))}'
+        payload = json.loads(fetch_text(url, encoding='utf-8', headers={
+            'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json',
+            'Referer': f'https://stock.naver.com/research/{page}',
+        }))
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise ValueError('네이버 리서치 응답 형식을 확인해 주세요.')
+        items = []
+        for row in payload['items']:
+            if not isinstance(row, dict):
+                continue
+            nid = str(row.get('nid', ''))
+            title = html.unescape(str(row.get('title') or '')).strip()
+            try:
+                published = parse_published_datetime(row.get('writeDate', ''))
+            except (ValueError, TypeError):
+                continue
+            if not nid.isdigit() or not title:
+                continue
+            if self.within_hours is not None and not within_last_hours(published.isoformat(), self.within_hours):
+                continue
+            broker = str(row.get('brokerName') or '').strip()
+            item_name = str(row.get('itemName') or '').strip()
+            display_title = f'{item_name}: {title}' if item_name and self.include_item_name else title
+            items.append(SourceItem(self.source_type, self.name, display_title,
+                                    f'https://stock.naver.com/research/{page}/{nid}', published.isoformat(),
+                                    strip_tags(row.get('content') or '') or title_only_content(item_name, title, broker),
+                                    [value for value in (broker, item_name) if value]))
             if len(items) >= self.limit:
                 break
         return items

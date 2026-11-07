@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src https: http: data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>데일리 리포트</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+<svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-news" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h4v4H7zM15 8h2m-2 4h2M7 16h10"/></symbol>
+  <symbol id="i-report" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M8 17v-3m4 3v-5m4 5v-2"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v17l-6-4-6 4z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="m9 3-1 3-3 1v4l-2 1 2 3v3l3 1 1 2h6l1-2 3-1v-3l2-3-2-1V7l-3-1-1-3z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6M8 12h13"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 3h7v7m0-7L10 14M10 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+</defs></svg>
+<div id="app" class="app-shell">
+  <section id="home-screen">
+    <header class="home-header">
+      <div class="brand-row"><span class="wordmark">DAILY REPORT<span class="brand-dot"></span></span><button id="settings-open" class="icon-button" aria-label="설정"><svg class="icon"><use href="#i-settings"/></svg></button></div>
+      <div class="title-row"><div><p id="today" class="eyebrow"></p><h1 id="page-title">모아보기</h1></div><button id="collect" class="primary collect-button"><svg class="icon"><use href="#i-refresh"/></svg><span>지금 수집</span></button></div>
+      <p id="collection-time" class="sync-label">직접 모으고, 차분히 읽는 하루</p>
+      <div id="stats" class="stats"><div><span>저장된 자료</span><strong id="stat-total">—</strong></div><div><span>아직 안 읽음</span><strong id="stat-unread">—</strong></div><div><span>보관한 자료</span><strong id="stat-starred">—</strong></div></div>
+    </header>
+    <main id="main-content">
+      <section id="collection-progress" class="collection-panel" aria-live="polite" hidden><div class="progress-title"><span class="live-dot"></span><strong id="progress-title">수집 준비 중</strong><button id="cancel-collection" class="text-button">중지</button></div><p id="progress-detail">선택한 소스에서 자료를 가져옵니다.</p><progress id="progress-bar" max="100" value="0"></progress></section>
+      <button id="result-open" class="result-summary" hidden><span id="result-label"></span><svg class="icon"><use href="#i-chevron"/></svg></button>
+      <label class="search-box"><svg class="icon"><use href="#i-search"/></svg><input id="search" type="search" placeholder="제목·출처 검색" autocomplete="off" aria-label="제목 또는 출처 검색"></label>
+      <div class="filter-row"><div id="read-filters" class="segmented" role="group" aria-label="읽음 상태"><button data-read="all" aria-pressed="true">전체</button><button data-read="unread" aria-pressed="false">안 읽음</button><button data-read="read" aria-pressed="false">읽음</button></div><select id="range-filter" aria-label="자료 표시 기간"><option value="all">저장된 전체</option><option value="1">최근 1일</option><option value="3">최근 3일</option><option value="7">최근 7일</option></select></div>
+      <div id="categories" class="category-strip" role="group" aria-label="카테고리"></div>
+      <div class="list-heading"><h2 id="list-heading">최신 자료</h2><span id="list-count" aria-live="polite">불러오는 중</span></div>
+      <div id="loading" class="loading-state" role="status"><span class="spinner"></span><p>저장된 자료를 불러옵니다</p></div>
+      <div id="item-list" class="item-list"></div>
+      <div id="empty" class="empty-state" hidden><div class="empty-icon"><svg class="icon"><use href="#i-news"/></svg></div><h2 id="empty-title">첫 자료를 모아보세요</h2><p id="empty-message">뉴스, 리포트, 공시를 내 휴대폰에.<br>지금 수집을 누르면 시작합니다.</p><button id="empty-action" class="primary">첫 수집 시작</button></div>
+      <button id="load-more" class="load-more" hidden>더 보기</button>
+      <p class="local-note">자료는 이 휴대폰에 저장됩니다 · 수동 수집</p>
+    </main>
+    <nav id="bottom-nav" class="bottom-nav" aria-label="주 메뉴">
+      <button data-tab="all" aria-current="page"><svg class="icon"><use href="#i-grid"/></svg><span>전체</span></button>
+      <button data-tab="news"><svg class="icon"><use href="#i-news"/></svg><span>뉴스</span></button>
+      <button data-tab="report"><svg class="icon"><use href="#i-report"/></svg><span>리포트</span></button>
+      <button data-tab="disclosure"><svg class="icon"><use href="#i-bell"/></svg><span>공시</span></button>
+      <button data-tab="saved"><svg class="icon"><use href="#i-bookmark"/></svg><span>보관함</span></button>
+    </nav>
+  </section>
+  <section id="reader-screen" class="detail-screen" hidden>
+    <header class="detail-header"><button id="reader-back" class="icon-button" aria-label="목록으로"><svg class="icon"><use href="#i-arrow"/></svg></button><span>자료 읽기</span><div class="reader-font-controls" role="group" aria-label="본문 글자 크기"><button id="font-down" aria-label="본문 글자 작게">가−</button><button id="font-up" aria-label="본문 글자 크게">가+</button></div></header>
+    <main class="reader-content"><span id="reader-category" class="kind-label"></span><h1 id="reader-title"></h1><p id="reader-meta" class="reader-meta"></p><div id="reader-status" class="reader-status" role="status"></div><div id="reader-body" class="reader-body"></div><button id="reader-retry" class="secondary" hidden>본문 다시 불러오기</button></main>
+    <footer class="reader-actions"><button id="reader-star" class="secondary"><svg class="icon"><use href="#i-bookmark"/></svg><span>보관</span></button><button id="reader-read" class="secondary"><svg class="icon"><use href="#i-check"/></svg><span>읽음</span></button><button id="reader-original" class="primary">원문 보기<svg class="icon"><use href="#i-external"/></svg></button></footer>
+  </section>
+  <section id="settings-screen" class="detail-screen" hidden>
+    <header class="detail-header"><button id="settings-back" class="icon-button" aria-label="설정 닫기"><svg class="icon"><use href="#i-arrow"/></svg></button><h1>설정</h1></header>
+    <main class="settings-content"><div class="settings-intro"><span class="small-label">MY CLIPPING</span><h2>나에게 필요한 소식만.</h2><p>수집 버튼을 누를 때만 자료를 가져옵니다.<br>AI와 백그라운드 수집은 사용하지 않습니다.</p></div>
+      <section class="settings-card"><h2>수집·정리 기준</h2><label for="collection-days">뉴스 수집과 자료 보관의 시작 시각</label><select id="collection-days"><option value="1">어제 오후 4시부터</option><option value="3">3일 전 오후 4시부터</option><option value="7">7일 전 오후 4시부터</option></select><p class="help">한국 시간 기준입니다. 이 시각 이전에 발행된 자료는 읽음 여부와 관계없이 정리합니다. 보관함 자료는 유지합니다. 날짜만 있는 리포트·공시는 해당 날짜 0시로 판단합니다.</p></section>
+      <section class="settings-card"><h2>자동 정리</h2><p id="cleanup-cutoff" class="help"></p><p id="cleanup-history" class="help"></p><p class="help">앱을 열거나 돌아올 때, 수집 후, 설정 저장 시 정리합니다. 정리한 목록과 본문은 삭제하고 재등록 방지 기록만 남깁니다. 기간을 다시 넓혀도 이미 정리한 자료는 돌아오지 않습니다. 앱을 삭제하거나 데이터를 초기화하면 정리 기록도 삭제됩니다.</p></section>
+      <section class="settings-card"><div class="card-section-heading"><h2>수집할 소스</h2><button id="sources-toggle" class="text-button">전체 해제</button></div><div id="source-options"></div></section>
+      <section class="settings-card"><h2>OpenDART 공시</h2><p id="dart-status" class="help">인증키 없이도 다른 소스는 수집할 수 있습니다.</p><label for="dart-key">공시 조회 인증키</label><input id="dart-key" type="password" autocomplete="off" placeholder="40자리 인증키 입력" maxlength="40"><label class="check-row"><input id="dart-clear" type="checkbox"><span>저장된 인증키 삭제</span></label><p class="help">AI 키가 아닌 공시 조회용 키입니다. 키는 앱 내부 저장소에 보관되며 목록 화면에 표시하지 않습니다.</p></section>
+      <p class="help settings-footnote">앱을 벗어나면 수집이 중단됩니다. 이미 전송한 요청은 응답 또는 시간 제한 후 종료됩니다. 앱 삭제 시 저장 자료와 읽음 표시도 삭제됩니다.</p>
+    </main><footer class="settings-footer"><button id="settings-save" class="primary">설정 저장</button></footer>
+  </section>
+  <section id="results-screen" class="detail-screen" hidden><header class="detail-header"><button id="results-back" class="icon-button" aria-label="수집 결과 닫기"><svg class="icon"><use href="#i-arrow"/></svg></button><h1>수집 결과</h1></header><main class="results-content"><p id="results-description" class="help"></p><div id="source-results"></div></main></section>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
