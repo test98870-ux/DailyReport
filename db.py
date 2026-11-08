@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from sources import normalize_news_url, parse_published_datetime
+from sources import KST, normalize_news_url, parse_published_datetime
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -96,6 +96,14 @@ def upsert_item(
         )
 
 
+def is_date_only_report(row: sqlite3.Row, published_at: datetime, cutoff: datetime) -> bool:
+    # Reports and filings carry only a date (stored as 00:00 KST); keep them from the cutoff's date.
+    if row["source_type"] == "뉴스":
+        return False
+    local = published_at.astimezone(KST)
+    return local.time() == dt_time(0) and local.date() >= cutoff.astimezone(KST).date()
+
+
 def fetch_recent_items(
     limit: int | None = 300,
     within_hours: int | None = 24,
@@ -121,7 +129,9 @@ def fetch_recent_items(
             published_at = parse_published_datetime(row["published_at"]).astimezone(timezone.utc)
         except ValueError:
             continue
-        if published_at <= now and (cutoff is None or published_at >= cutoff):
+        if published_at > now:
+            continue
+        if cutoff is None or published_at >= cutoff or is_date_only_report(row, published_at, cutoff):
             dated_rows.append((published_at, row))
     dated_rows.sort(key=lambda entry: (entry[0], entry[1]["id"]), reverse=True)
     filtered: list[sqlite3.Row] = []

@@ -2,38 +2,45 @@
   {
     "type": "naver_research",
     "name": "네이버 금융 종목분석",
-    "list_path": "company_list.naver",
+    "category": "company",
     "source_type": "증권사 리포트",
     "include_item_name": true,
-    "limit": 4
+    "limit": 0
   },
   {
     "type": "naver_research",
     "name": "네이버 금융 시황정보",
-    "list_path": "market_info_list.naver",
+    "category": "market",
     "source_type": "증권사 리포트",
-    "limit": 4
+    "limit": 0
   },
   {
     "type": "naver_research",
     "name": "네이버 금융 산업분석",
-    "list_path": "industry_list.naver",
+    "category": "industry",
     "source_type": "증권사 리포트",
-    "limit": 3
+    "limit": 0
   },
   {
     "type": "naver_research",
     "name": "네이버 금융 투자전략",
-    "list_path": "invest_list.naver",
+    "category": "invest",
     "source_type": "증권사 리포트",
-    "limit": 3
+    "limit": 0
   },
   {
     "type": "naver_research",
     "name": "네이버 금융 경제분석",
-    "list_path": "economy_list.naver",
+    "category": "economy",
     "source_type": "증권사 리포트",
-    "limit": 3
+    "limit": 0
+  },
+  {
+    "type": "naver_research",
+    "name": "네이버 금융 채권분석",
+    "category": "debenture",
+    "source_type": "증권사 리포트",
+    "limit": 0
   },
   {
     "type": "opendart",
@@ -55,7 +62,7 @@
     "type": "hankyung_consensus",
     "name": "한경 컨센서스",
     "source_type": "증권사 리포트",
-    "limit": 6
+    "limit": 0
   },
   {
     "type": "edgar_company",
@@ -189,5 +196,11 @@
     "source_type": "뉴스",
     "limit": 0,
     "hours": 24
+  },
+  {
+    "type": "damoang_board",
+    "name": "다모앙 주식한당",
+    "board": "stock",
+    "source_type": "뉴스"
   }
 ]

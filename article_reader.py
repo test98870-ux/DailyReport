@@ -5,7 +5,9 @@ import re
 from functools import lru_cache
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+
+from sources import SSL_CONTEXT
 
 ALLOWED_HOSTS = {'v.daum.net', 'news.naver.com', 'n.news.naver.com', 'www.clien.net', 'clien.net', 'damoang.net', 'www.damoang.net'}
 BODY_IDS = {'harmonyContainer', 'dic_area', 'newsct_article', 'articleBodyContents', 'article-view-content-div'}
@@ -125,7 +127,7 @@ def load_article(url: str) -> list[dict[str, str]]:
     if not allowed_url(url):
         raise ValueError('이 사이트의 본문 읽기는 아직 지원하지 않습니다.')
     request = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; DailyReport/1.0)'})
-    with build_opener(ArticleRedirectHandler()).open(request, timeout=15) as response:
+    with build_opener(ArticleRedirectHandler(), HTTPSHandler(context=SSL_CONTEXT)).open(request, timeout=15) as response:
         charset = response.headers.get_content_charset() or 'utf-8'
         body = response.read(5 * 1024 * 1024 + 1)
         if len(body) > 5 * 1024 * 1024:

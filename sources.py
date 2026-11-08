@@ -5,8 +5,9 @@ import http.client
 import json
 import os
 import re
+import ssl
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
@@ -24,6 +25,16 @@ KST = timezone(timedelta(hours=9))
 NEWS_COLLECTION_START_HOUR = 16
 DEFAULT_COLLECTION_DAYS = 1
 NAVER_FINANCE_BASE = "https://finance.naver.com/research/"
+NAVER_RESEARCH_API = "https://stock.naver.com/api/stockSecurity/researches/v2/"
+NAVER_RESEARCH_WEB = "https://stock.naver.com/research/"
+LEGACY_NAVER_RESEARCH_PATHS = {
+    "company_list.naver": "company",
+    "market_info_list.naver": "market",
+    "industry_list.naver": "industry",
+    "invest_list.naver": "invest",
+    "economy_list.naver": "economy",
+    "debenture_list.naver": "debenture",
+}
 NAVER_ROOT = "https://finance.naver.com/"
 DART_LIST_API = "https://opendart.fss.or.kr/api/list.json"
 DART_VIEWER_BASE = "https://dart.fss.or.kr/dsaf001/main.do"
@@ -37,6 +48,12 @@ DAUM_NEWS_BASE = "https://news.daum.net"
 CLIEN_NEWS_URL = "https://www.clien.net/service/board/news"
 DAMOANG_NEWS_URL = "https://damoang.net/new"
 
+# Python 3.13+ enables VERIFY_X509_STRICT by default, which rejects certificates
+# re-signed by corporate TLS inspection proxies (missing Authority Key Identifier).
+# Keep certificate verification on, but relax only the strict flag.
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+
 
 @dataclass
 class SourceItem:
@@ -47,6 +64,7 @@ class SourceItem:
     published_at: str
     content: str
     tags: list[str]
+    summary: str = ""
 
 
 def title_only_content(*parts: str) -> str:
@@ -72,7 +90,7 @@ def fetch_text(url: str, encoding: str | None = None, headers: dict[str, str] | 
     if headers:
         request_headers.update(headers)
     request = Request(url, headers=request_headers)
-    with urlopen(request, timeout=20) as response:
+    with urlopen(request, timeout=20, context=SSL_CONTEXT) as response:
         try:
             body = response.read()
         except http.client.IncompleteRead as exc:
@@ -214,6 +232,22 @@ def within_news_collection_window(published_at: str, now: datetime | None = None
     return start_utc <= published <= now_utc
 
 
+def report_window_start_date(now: datetime | None = None) -> date:
+    """Reports carry only a date, so they are kept from the window's start date."""
+    return news_collection_window_start(now).date()
+
+
+def date_only_published_at(day: date) -> str:
+    return datetime.combine(day, time(0), tzinfo=KST).isoformat()
+
+
+def html_to_paragraphs(fragment: str) -> str:
+    text = re.sub(r"<br\s*/?>|</p>|</li>|</div>|</h\d>", "\n", fragment or "", flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def before_news_collection_window(published_at: str, now: datetime | None = None) -> bool:
     try:
         published = parse_published_datetime(published_at).astimezone(timezone.utc)
@@ -256,7 +290,7 @@ class RssSource(Source):
             self.feed_url,
             headers={"User-Agent": "DailyReportBot/1.0"},
         )
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=15, context=SSL_CONTEXT) as response:
             xml_body = response.read()
 
         root = ElementTree.fromstring(xml_body)
@@ -415,130 +449,90 @@ class OpenDartSource(Source):
 
 
 class NaverResearchSource(Source):
+    PAGE_SIZE = 50
+    MAX_PAGES = 10
+
     def __init__(
         self,
         *,
         name: str,
-        list_path: str,
         source_type: str,
-        limit: int = 5,
+        category: str = "",
+        list_path: str = "",
+        limit: int = 0,
         include_item_name: bool = False,
     ) -> None:
         self.name = name
-        self.list_path = list_path
+        self.category = category or LEGACY_NAVER_RESEARCH_PATHS.get(list_path, "")
+        if not self.category:
+            raise ValueError(f"{name}: 네이버 리서치 category를 지정하세요.")
         self.source_type = source_type
         self.limit = limit
         self.include_item_name = include_item_name
         self.within_hours: int | None = 24
 
     def fetch(self) -> list[SourceItem]:
-        listing_html = fetch_text(urljoin(NAVER_FINANCE_BASE, self.list_path), encoding="euc-kr")
-        if '/_next/static/' in listing_html and not self._extract_detail_path(listing_html):
-            return self._fetch_current_api()
-        rows = re.findall(r"<tr>(.*?)</tr>", listing_html, flags=re.S)
+        # within_hours=None (mobile app) disables the date window and reads only the latest page.
+        start_day = report_window_start_date() if self.within_hours is not None else None
         items: list[SourceItem] = []
-        for row_html in rows:
-            detail_path = self._extract_detail_path(row_html)
-            if not detail_path:
-                continue
-            title = self._extract_title(row_html, detail_path)
-            broker = self._extract_broker(row_html)
-            published_at_raw = self._extract_published_date(row_html)
-            if not title or not broker or not published_at_raw:
-                continue
-            published_at = parse_naver_date(published_at_raw)
-            if self.within_hours is not None and not within_last_hours(published_at, self.within_hours):
-                break
-            item_name = self._extract_item_name(row_html)
-            detail_url = urljoin(NAVER_FINANCE_BASE, detail_path)
-            pdf_url = self._extract_pdf_url(row_html)
-            display_title = f"{item_name}: {title}" if item_name and self.include_item_name else title
-            tags = [broker]
-            if item_name:
-                tags.append(item_name)
-            items.append(
-                SourceItem(
-                    source_type=self.source_type,
-                    source_name=self.name,
-                    title=display_title,
-                    url=pdf_url or detail_url,
-                    published_at=published_at,
-                    content=title_only_content(item_name, title, broker),
-                    tags=tags,
-                )
-            )
-            if len(items) >= self.limit:
+        for page in range(self.MAX_PAGES):
+            query = urlencode({"index": page, "size": self.PAGE_SIZE})
+            payload = json.loads(fetch_text(f"{NAVER_RESEARCH_API}{self.category}?{query}", encoding="utf-8", headers={
+                "User-Agent": "Mozilla/5.0", "Accept": "application/json",
+                "Referer": f"{NAVER_RESEARCH_WEB}{self._web_page()}",
+            }))
+            rows = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise RuntimeError("네이버 리서치 응답 형식이 바뀌었습니다. API 응답을 확인하세요.")
+            reached_older = False
+            for row in rows:
+                item = self._to_item(row)
+                if item is None:
+                    continue
+                if start_day is not None and parse_published_datetime(item.published_at).date() < start_day:
+                    reached_older = True
+                    break
+                items.append(item)
+                if self.limit > 0 and len(items) >= self.limit:
+                    return items
+            if reached_older or start_day is None or not payload.get("hasNext"):
                 break
         return items
 
-    def _fetch_current_api(self) -> list[SourceItem]:
-        # Npay's current official research UI loads these public JSON lists.
-        category = self.list_path.removesuffix('_list.naver')
-        category = 'market' if category == 'market_info' else category
-        if category not in {'company', 'industry', 'invest', 'economy', 'market'}:
-            raise ValueError('지원하지 않는 네이버 리서치 카테고리입니다.')
-        page = 'daily' if category == 'market' else category
-        url = f'https://stock.naver.com/api/stockSecurity/researches/v2/{category}?index=0&size={max(15, min(self.limit, 100))}'
-        payload = json.loads(fetch_text(url, encoding='utf-8', headers={
-            'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json',
-            'Referer': f'https://stock.naver.com/research/{page}',
-        }))
-        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
-            raise ValueError('네이버 리서치 응답 형식을 확인해 주세요.')
-        items = []
-        for row in payload['items']:
-            if not isinstance(row, dict):
-                continue
-            nid = str(row.get('nid', ''))
-            title = html.unescape(str(row.get('title') or '')).strip()
-            try:
-                published = parse_published_datetime(row.get('writeDate', ''))
-            except (ValueError, TypeError):
-                continue
-            if not nid.isdigit() or not title:
-                continue
-            if self.within_hours is not None and not within_last_hours(published.isoformat(), self.within_hours):
-                continue
-            broker = str(row.get('brokerName') or '').strip()
-            item_name = str(row.get('itemName') or '').strip()
-            display_title = f'{item_name}: {title}' if item_name and self.include_item_name else title
-            items.append(SourceItem(self.source_type, self.name, display_title,
-                                    f'https://stock.naver.com/research/{page}/{nid}', published.isoformat(),
-                                    strip_tags(row.get('content') or '') or title_only_content(item_name, title, broker),
-                                    [value for value in (broker, item_name) if value]))
-            if len(items) >= self.limit:
-                break
-        return items
+    def _web_page(self) -> str:
+        # The market list API is shown under /research/daily on the web.
+        return "daily" if self.category == "market" else self.category
 
-    def _extract_detail_path(self, row_html: str) -> str | None:
-        match = re.search(r'href="((?:company|market_info|industry|economy|invest)_read\.naver\?[^"]+)"', row_html)
-        return html.unescape(match.group(1)) if match else None
-
-    def _extract_title(self, row_html: str, detail_path: str) -> str:
-        pattern = rf'href="{re.escape(detail_path)}">(.+?)</a>'
-        match = re.search(pattern, row_html, flags=re.S)
-        return strip_tags(match.group(1)) if match else ""
-
-    def _extract_broker(self, row_html: str) -> str:
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.S)
-        cleaned = [strip_tags(cell) for cell in cells if strip_tags(cell)]
-        if self.include_item_name and len(cleaned) >= 3:
-            return cleaned[2]
-        if not self.include_item_name and len(cleaned) >= 2:
-            return cleaned[1]
-        return ""
-
-    def _extract_item_name(self, row_html: str) -> str:
-        match = re.search(r'class="stock_item">(.+?)</a>', row_html, flags=re.S)
-        return strip_tags(match.group(1)) if match else ""
-
-    def _extract_pdf_url(self, row_html: str) -> str:
-        match = re.search(r'href="(https://stock\.pstatic\.net/[^"]+\.pdf)"', row_html)
-        return html.unescape(match.group(1)) if match else ""
-
-    def _extract_published_date(self, row_html: str) -> str:
-        match = re.search(r'<td class="date"[^>]*>(\d{2}\.\d{2}\.\d{2})</td>', row_html)
-        return match.group(1) if match else ""
+    def _to_item(self, row: dict) -> SourceItem | None:
+        if not isinstance(row, dict):
+            return None
+        title = html.unescape(row.get("title") or "").strip()
+        nid = str(row.get("nid") or "").strip()
+        try:
+            day = date.fromisoformat(row.get("writeDate") or "")
+        except ValueError:
+            return None
+        if not title or not nid.isdigit():
+            return None
+        broker = (row.get("brokerName") or "").strip()
+        item_name = (row.get("itemName") or "").strip()
+        opinion = (row.get("opinionText") or "").strip()
+        goal_price = str(row.get("goalPrice") or "").strip()
+        display_title = f"{item_name}: {title}" if item_name and self.include_item_name else title
+        facts = [broker, item_name, opinion]
+        if goal_price.isdigit() and int(goal_price) > 0:
+            facts.append(f"목표가 {int(goal_price):,}원")
+        summary_lines = [" · ".join(value for value in facts if value), html_to_paragraphs(row.get("content") or "")]
+        return SourceItem(
+            source_type=self.source_type,
+            source_name=self.name,
+            title=display_title,
+            url=f"{NAVER_RESEARCH_WEB}{self._web_page()}/{nid}",
+            published_at=date_only_published_at(day),
+            content=title_only_content(item_name, title, broker),
+            tags=[value for value in [broker, item_name] if value],
+            summary="\n".join(line for line in summary_lines if line),
+        )
 
 class HankyungConsensusSource(Source):
     def __init__(
@@ -547,7 +541,7 @@ class HankyungConsensusSource(Source):
         name: str,
         source_type: str,
         report_type: str | None = None,
-        limit: int = 5,
+        limit: int = 0,
         sdate: str | None = None,
         edate: str | None = None,
     ) -> None:
@@ -555,18 +549,21 @@ class HankyungConsensusSource(Source):
         self.source_type = source_type
         self.report_type = report_type
         self.limit = limit
-        today = datetime.now(KST).date().isoformat()
-        self.sdate = sdate or today
-        self.edate = edate or today
+        self.sdate = sdate
+        self.edate = edate
 
     def fetch(self) -> list[SourceItem]:
+        start_day = report_window_start_date()
         params = {
-            "sdate": self.sdate,
-            "edate": self.edate,
+            "sdate": self.sdate or start_day.isoformat(),
+            "edate": self.edate or datetime.now(KST).date().isoformat(),
+            "pagenum": 500,
         }
         if self.report_type:
             params["report_type"] = self.report_type
         html_text = fetch_text(f"{HANKYUNG_BASE}/analysis/list?{urlencode(params)}", encoding="utf-8")
+        if "<table" not in html_text:
+            raise RuntimeError("한경 컨센서스 목록 표를 찾지 못했습니다. 페이지 구조를 확인하세요.")
         row_matches = re.findall(r"<tr(?: class=\"[^\"]+\")?>(.*?)</tr>", html_text, flags=re.S)
         items: list[SourceItem] = []
         for row_html in row_matches:
@@ -575,15 +572,20 @@ class HankyungConsensusSource(Source):
                 continue
             date_text = strip_tags(cells[0])
             category = strip_tags(cells[1])
-            link_match = re.search(r'href="(/analysis/downpdf\?report_idx=\d+)"', cells[2])
-            title = strip_tags(cells[2])
+            link_match = re.search(r'href="(/analysis/downpdf\?report_idx=\d+)"[^>]*>(.*?)</a>', cells[2], flags=re.S)
+            title = strip_tags(link_match.group(2)) if link_match else ""
+            highlights = [strip_tags(point) for point in re.findall(r"<li[^>]*>(.*?)</li>", cells[2], flags=re.S)]
             analyst = strip_tags(cells[3])
             broker = strip_tags(cells[4])
             if not date_text or not link_match or not title:
                 continue
-            published_at = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=KST).isoformat()
-            if not within_last_hours(published_at, 24):
+            try:
+                day = datetime.strptime(date_text, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if day < start_day:
                 break
+            published_at = date_only_published_at(day)
             items.append(
                 SourceItem(
                     source_type=self.source_type,
@@ -593,9 +595,10 @@ class HankyungConsensusSource(Source):
                     published_at=published_at,
                     content=title_only_content(category, broker, analyst, title),
                     tags=[value for value in [category, broker, analyst] if value],
+                    summary="\n".join([" · ".join(value for value in [broker, analyst, category] if value)] + highlights),
                 )
             )
-            if len(items) >= self.limit:
+            if self.limit > 0 and len(items) >= self.limit:
                 break
         return items
 
@@ -673,7 +676,7 @@ class EdgarCompanySource(Source):
     def fetch(self) -> list[SourceItem]:
         headers = {"User-Agent": "DailyReportBot/1.0 dailyreport@example.com"}
         request = Request(f"{SEC_SUBMISSIONS_BASE}CIK{self.cik}.json", headers=headers)
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=20, context=SSL_CONTEXT) as response:
             payload = json.loads(response.read().decode("utf-8"))
 
         recent = payload.get("filings", {}).get("recent", {})
@@ -696,9 +699,10 @@ class EdgarCompanySource(Source):
             primary_document = primary_documents[index]
             primary_description = primary_descriptions[index]
             detail_url = f"{SEC_ARCHIVES_BASE}{cik_numeric}/{accession_slug}/{accession}-index.htm"
-            published_at = datetime.strptime(filing_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).isoformat()
-            if not within_last_hours(published_at, 24):
+            filing_day = datetime.strptime(filing_date, "%Y-%m-%d").date()
+            if filing_day < report_window_start_date():
                 break
+            published_at = date_only_published_at(filing_day)
             description_bits = [
                 f"회사명: {company_name}",
                 f"티커: {ticker or '미기재'}",
@@ -1033,6 +1037,44 @@ class ClienNewsSource(Source):
         return items
 
 
+class DamoangBoardSource(Source):
+    """Reads a Damoang board through its public RSS feed; board pages sit behind a bot challenge."""
+
+    def __init__(self, *, name: str, board: str, source_type: str = "뉴스") -> None:
+        self.name = name
+        self.board = board.strip("/")
+        self.source_type = source_type
+
+    def fetch(self) -> list[SourceItem]:
+        xml_body = fetch_text(f"https://damoang.net/rss/{self.board}", encoding="utf-8")
+        root = ElementTree.fromstring(xml_body)
+        if root.find("channel") is None:
+            raise RuntimeError("다모앙 RSS 형식이 바뀌었습니다. 피드 주소를 확인하세요.")
+        items: list[SourceItem] = []
+        for node in root.findall(".//item"):
+            title = html.unescape((node.findtext("title") or "").strip())
+            link = (node.findtext("link") or "").strip()
+            author = (node.findtext("author") or "").strip()
+            try:
+                published_at = parsedate_to_datetime(node.findtext("pubDate") or "").astimezone(KST).isoformat()
+            except (TypeError, ValueError):
+                continue
+            if not title or not link or not within_news_collection_window(published_at):
+                continue
+            items.append(
+                SourceItem(
+                    source_type=self.source_type,
+                    source_name=self.name,
+                    title=title,
+                    url=link,
+                    published_at=published_at,
+                    content=title_only_content("다모앙", author, title),
+                    tags=[value for value in ["다모앙", author] if value],
+                )
+            )
+        return items
+
+
 class DamoangNewsSource(Source):
     def __init__(self, *, name: str, source_type: str = "뉴스", limit: int = 0, hours: int = 24) -> None:
         self.name = name
@@ -1060,7 +1102,7 @@ def build_sources() -> Iterable[Source]:
             if row["type"] not in {
                 "rss", "sample_file", "naver_research", "opendart", "hankyung_consensus",
                 "wisereport", "edgar_company", "naver_news_section", "daum_news_section",
-                "clien_news", "damoang_news", "kind_rss",
+                "clien_news", "damoang_news", "damoang_board", "kind_rss",
             }:
                 raise ValueError(f"지원하지 않는 소스 유형: {row['type']}")
             if row["type"] == "rss":
@@ -1074,9 +1116,10 @@ def build_sources() -> Iterable[Source]:
             if row["type"] == "naver_research":
                 yield NaverResearchSource(
                     name=row["name"],
-                    list_path=row["list_path"],
+                    category=row.get("category", ""),
+                    list_path=row.get("list_path", ""),
                     source_type=row["source_type"],
-                    limit=int(row.get("limit", 5)),
+                    limit=int(row.get("limit", 0)),
                     include_item_name=bool(row.get("include_item_name", False)),
                 )
             if row["type"] == "opendart":
@@ -1097,7 +1140,7 @@ def build_sources() -> Iterable[Source]:
                     name=row["name"],
                     source_type=row.get("source_type", "증권사 리포트"),
                     report_type=row.get("report_type"),
-                    limit=int(row.get("limit", 5)),
+                    limit=int(row.get("limit", 0)),
                     sdate=row.get("sdate"),
                     edate=row.get("edate"),
                 )
@@ -1149,6 +1192,12 @@ def build_sources() -> Iterable[Source]:
                     source_type=row.get("source_type", "뉴스"),
                     limit=int(row.get("limit", 12)),
                     hours=int(row.get("hours", 24)),
+                )
+            if row["type"] == "damoang_board":
+                yield DamoangBoardSource(
+                    name=row["name"],
+                    board=row["board"],
+                    source_type=row.get("source_type", "뉴스"),
                 )
             if row["type"] == "kind_rss":
                 yield KindRssSource(
