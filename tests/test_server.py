@@ -17,7 +17,13 @@ class ServerTests(unittest.TestCase):
             static.mkdir()
             (static / "styles.css").write_text("body {}")
             (base / "private.txt").write_text("private")
-            (static / "link.txt").symlink_to(base / "private.txt")
+            escape_paths = ["/static/../private.txt", "/static/", "/static/missing.css"]
+            try:
+                (static / "link.txt").symlink_to(base / "private.txt")
+                escape_paths.append("/static/link.txt")
+            except OSError:
+                # Windows needs Developer Mode or admin rights to create symlinks.
+                pass
             with patch.object(main, "STATIC_DIR", static):
                 server = main.ReusableThreadingHTTPServer(("127.0.0.1", 0), main.DashboardHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -26,7 +32,7 @@ class ServerTests(unittest.TestCase):
                 try:
                     with urlopen(root + "/static/styles.css") as response:
                         self.assertEqual(response.read(), b"body {}")
-                    for path in ["/static/../private.txt", "/static/link.txt", "/static/", "/static/missing.css"]:
+                    for path in escape_paths:
                         with self.subTest(path=path), self.assertRaises(HTTPError) as error:
                             urlopen(root + path)
                         self.assertEqual(error.exception.code, 404)
