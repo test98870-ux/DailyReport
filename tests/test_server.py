@@ -10,6 +10,17 @@ import main
 
 
 class ServerTests(unittest.TestCase):
+    def test_period_filter_uses_publish_time_or_first_collection_for_date_only_items(self):
+        news = {"source_type": "뉴스", "published_at": "2026-11-16T00:00:00+09:00", "created_at": "2026-11-16 04:30:00"}
+        report = {"source_type": "증권사 리포트", "published_at": "2026-11-16T00:00:00+09:00", "created_at": "2026-11-16 04:30:00"}
+        filing = {"source_type": "공시", "published_at": "2026-11-16T10:15:00+09:00", "created_at": "2026-11-16 04:30:00"}
+        self.assertEqual(main.filter_timestamp_ms(news), 1794754800000)  # 2026-11-15T15:00:00Z
+        self.assertEqual(main.filter_timestamp_ms(report), 1794803400000)  # 2026-11-16T04:30:00Z
+        self.assertEqual(main.filter_timestamp_ms(filing), 1794791700000)  # 2026-11-16T01:15:00Z
+        self.assertEqual(main.filter_timestamp_ms({"source_type": "뉴스", "published_at": "?"}), 0)
+        card = main.render_card({**report, "title": "제목", "source_name": "한경 컨센서스", "url": "https://example.com/a"})
+        self.assertIn('data-filter-ts="1794803400000"', card)
+
     def test_static_files_cannot_escape_static_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

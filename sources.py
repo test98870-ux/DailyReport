@@ -812,8 +812,10 @@ class DaumNewsSectionSource(Source):
         source_type: str = "뉴스",
         limit: int = 0,
         hours: int = 24,
+        require_listing: bool = True,
     ) -> None:
         self.name = name
+        self.require_listing = require_listing
         self.section_path = section_path.strip("/")
         self.section_url = section_url.strip()
         self.section_name = section_name
@@ -839,7 +841,7 @@ class DaumNewsSectionSource(Source):
                 continue
             seen_urls.add(normalized_url)
             items.append(item)
-        if not candidates and not re.search(r'https://v\.daum\.net/v/\d+|hamny-\d+', html_text):
+        if self.require_listing and not candidates and not re.search(r'https://v\.daum\.net/v/\d+|hamny-\d+', html_text):
             raise RuntimeError("다음 기사 목록을 찾지 못했습니다. 페이지 구조나 응답을 확인하세요.")
         items.sort(key=lambda item: parse_published_datetime(item.published_at), reverse=True)
         return items[:self.limit] if self.limit > 0 else items
@@ -1092,6 +1094,70 @@ class DamoangNewsSource(Source):
         return []
 
 
+def daum_section_key(url: str) -> str:
+    parsed = urlparse(urljoin(f"{DAUM_NEWS_BASE}/", url.strip()))
+    path = parsed.path.strip("/")
+    if parsed.netloc.lower() == "news.daum.net" and path == "news/home":
+        path = ""
+    return f"{parsed.netloc.lower()}/{path}"
+
+
+def discover_daum_sections(html_text: str) -> list[tuple[str, str]]:
+    """Returns (label, url) for the menu sections and titled blocks linked from the Daum news home."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for attrs, inner in re.findall(r"<a\b([^>]*)>(.*?)</a>", html_text, flags=re.S):
+        class_match = re.search(r'''class=["']([^"']*)["']''', attrs)
+        href_match = re.search(r'''href=["']([^"']+)["']''', attrs)
+        if not class_match or not href_match:
+            continue
+        if not {"link_gnb", "link_tit"} & set(class_match.group(1).split()):
+            continue
+        url = urljoin(f"{DAUM_NEWS_BASE}/", html.unescape(href_match.group(1)).split("#", 1)[0])
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.netloc.lower() not in {"news.daum.net", "issue.daum.net"}:
+            continue
+        label = normalize_whitespace(strip_tags(inner))
+        key = daum_section_key(url)
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        found.append((label, url))
+    return found
+
+
+def discovered_daum_sources(row: dict, config: list[dict]) -> list[Source]:
+    # Sections disabled in the config stay known, so discovery does not re-enable them.
+    known = {
+        daum_section_key(entry.get("section_url") or entry.get("section_path", ""))
+        for entry in config
+        if entry.get("type") == "daum_news_section"
+    }
+    try:
+        home = fetch_text(
+            f"{DAUM_NEWS_BASE}/",
+            encoding="utf-8",
+            headers={"Referer": DAUM_NEWS_BASE, "User-Agent": "Mozilla/5.0 DailyReportBot/1.0"},
+        )
+    except Exception as exc:
+        return [SkippedSource(row["name"], f"다음 뉴스 메뉴 확인 실패: {exc}")]
+    sections = discover_daum_sections(home)
+    if not sections:
+        return [SkippedSource(row["name"], "다음 뉴스 메뉴를 찾지 못했습니다. 페이지 구조를 확인하세요.")]
+    return [
+        DaumNewsSectionSource(
+            name=f"다음 뉴스 {label}",
+            section_url=url,
+            section_name=label,
+            source_type=row.get("source_type", "뉴스"),
+            limit=int(row.get("limit", 0)),
+            require_listing=False,
+        )
+        for label, url in sections
+        if daum_section_key(url) not in known
+    ]
+
+
 def build_sources() -> Iterable[Source]:
     load_env_file()
     if DEFAULT_CONFIG_FILE.exists():
@@ -1102,7 +1168,7 @@ def build_sources() -> Iterable[Source]:
             if row["type"] not in {
                 "rss", "sample_file", "naver_research", "opendart", "hankyung_consensus",
                 "wisereport", "edgar_company", "naver_news_section", "daum_news_section",
-                "clien_news", "damoang_news", "damoang_board", "kind_rss",
+                "clien_news", "damoang_news", "damoang_board", "kind_rss", "daum_news_discover",
             }:
                 raise ValueError(f"지원하지 않는 소스 유형: {row['type']}")
             if row["type"] == "rss":
@@ -1178,6 +1244,8 @@ def build_sources() -> Iterable[Source]:
                     limit=int(row.get("limit", 10)),
                     hours=int(row.get("hours", 24)),
                 )
+            if row["type"] == "daum_news_discover":
+                yield from discovered_daum_sources(row, config)
             if row["type"] == "clien_news":
                 yield ClienNewsSource(
                     name=row["name"],

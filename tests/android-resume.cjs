@@ -55,7 +55,7 @@ function launch(){adb('shell','am','start','-W','-a','android.intent.action.MAIN
       document.querySelector('[data-tab="news"]').click();
       document.querySelector('[data-read="all"]').click();
       const search=document.getElementById('search');search.value='';search.dispatchEvent(new Event('input'));
-      document.getElementById('range-filter').value='all';document.getElementById('range-filter').dispatchEvent(new Event('change'));
+      document.querySelector('[data-range="all"]').click();
       const card=document.querySelector('.item-card.is-read') || document.querySelector('.item-card');
       if(!card)throw Error('Collect news before running this test.');
       card.querySelector('.card-title').click();

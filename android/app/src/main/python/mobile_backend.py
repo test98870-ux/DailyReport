@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -216,6 +216,18 @@ def _meta(key: str, value) -> None:
         conn.execute('INSERT OR REPLACE INTO mobile_meta VALUES (?, ?)', (key, _json(value)))
 
 
+def _filter_at(row, kind: str) -> str:
+    # Reports and filings may carry only a date (00:00 KST); hour filters then use the first collection time.
+    try:
+        published = sources.parse_published_datetime(row['published_at'])
+        if kind != 'news' and published.astimezone(sources.KST).time() == dt_time(0):
+            collected = datetime.strptime(row['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            return max(published, collected).astimezone(sources.KST).isoformat()
+    except (TypeError, ValueError):
+        pass
+    return row['published_at']
+
+
 def snapshot(cleanup: bool = True) -> str:
     if cleanup:
         _run_cleanup()
@@ -229,7 +241,7 @@ def snapshot(cleanup: bool = True) -> str:
         mark = marks.get(key, {})
         kind = 'news' if row['source_type'] == '뉴스' else 'disclosure' if '공시' in row['source_type'] else 'report'
         items.append({'id': row['id'], 'title': row['title'], 'url': row['url'], 'source': row['source_name'],
-                      'published': row['published_at'], 'kind': kind, 'category': _category(row),
+                      'published': row['published_at'], 'filterAt': _filter_at(row, kind), 'kind': kind, 'category': _category(row),
                       'read': bool(mark.get('is_read')), 'starred': bool(mark.get('starred'))})
     return _json({'items': items, 'lastCollection': meta.get('last_collection'),
                   'lastResult': meta.get('last_result'), 'days': _settings()['days'], 'cleanup': _cleanup_info()})

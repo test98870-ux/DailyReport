@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -159,6 +159,12 @@ def render_dashboard() -> str:
       const newsCategoryOffsets = {};
       let selectedNewsCard = null;
       let articleRequest = null;
+
+      const timeFilterStorageKey = "daily-report-time-filter-hours";
+      const timeFilterOptions = [1, 2, 6, 0];
+      const timeFilterButtons = Array.from(document.querySelectorAll(".time-filter-button"));
+      const timeFilterEmpty = document.getElementById("time-filter-empty");
+      let timeFilterHours = 0;
 
       const viewedStorageKey = "daily-report-viewed-keys";
       const fontStorageKey = "daily-report-reader-font";
@@ -395,6 +401,7 @@ def render_dashboard() -> str:
           panel.hidden = !active;
         });
         panelDescription.textContent = tabCopy[targetId] || "";
+        updateTimeFilterEmpty();
         syncNewsReader();
         if (slideshowEnabled) {
           renderSlideshowFrame();
@@ -416,6 +423,61 @@ def render_dashboard() -> str:
           panel.hidden = !active;
         });
         syncNewsReader();
+      }
+
+      function timeFilterCutoff() {
+        return timeFilterHours > 0 ? Date.now() - timeFilterHours * 3600 * 1000 : 0;
+      }
+
+      function isInTimeRange(card, cutoff = timeFilterCutoff()) {
+        return !cutoff || Number(card.dataset.filterTs || 0) >= cutoff;
+      }
+
+      function setCountText(element, count, suffix = "") {
+        if (!element) {
+          return;
+        }
+        if (element.dataset.totalText === undefined) {
+          element.dataset.totalText = element.textContent;
+        }
+        element.textContent = timeFilterHours > 0 ? `${count}${suffix}` : element.dataset.totalText;
+      }
+
+      function updateTimeFilterCounts() {
+        // Counts follow the period filter only; read items stay counted, as before.
+        const cutoff = timeFilterCutoff();
+        const countIn = (scope) => Array.from(scope?.querySelectorAll("[data-item-key]") || []).filter((card) => isInTimeRange(card, cutoff)).length;
+        tabButtons.forEach((button) => setCountText(button.querySelector("span"), countIn(document.getElementById(button.dataset.tabTarget))));
+        newsFilterButtons.forEach((button) => setCountText(button.querySelector("span"), countIn(document.getElementById(button.dataset.newsTarget || ""))));
+        document.querySelectorAll(".category-block").forEach((block) => setCountText(block.querySelector(".category-count"), countIn(block), "건"));
+      }
+
+      function updateTimeFilterEmpty() {
+        const activePanel = getActivePanel();
+        const hasVisible = Array.from(activePanel?.querySelectorAll("[data-item-key]") || []).some((card) => !card.hidden);
+        const hasInRange = Array.from(activePanel?.querySelectorAll("[data-item-key]") || []).some((card) => isInTimeRange(card));
+        timeFilterEmpty.hidden = timeFilterHours === 0 || hasVisible;
+        timeFilterEmpty.textContent = hasInRange
+          ? `최근 ${timeFilterHours}시간 자료를 모두 읽었습니다.`
+          : `최근 ${timeFilterHours}시간 안에 올라온 자료가 없습니다.`;
+      }
+
+      function setTimeFilter(hours) {
+        timeFilterHours = timeFilterOptions.includes(hours) ? hours : 0;
+        writeStored(timeFilterStorageKey, String(timeFilterHours));
+        timeFilterButtons.forEach((button) => {
+          const active = Number(button.dataset.hours) === timeFilterHours;
+          button.classList.toggle("is-active", active);
+          button.setAttribute("aria-pressed", String(active));
+        });
+        clearNewsNavigation();
+        renderItemVisibility();
+        ensureActiveNewsCategory();
+        if (slideshowEnabled) {
+          slideshowIndex = 0;
+          newsCategoryCycleIndex = 0;
+          refreshSlideshow();
+        }
       }
 
       function getHiddenItemIds() {
@@ -470,9 +532,11 @@ def render_dashboard() -> str:
         const hiddenIds = new Set(getHiddenItemIds());
         itemCards.forEach((card) => {
           const shouldHide = getItemReadKeys(card).some((itemKey) => hiddenIds.has(itemKey));
-          card.hidden = shouldHide;
+          card.hidden = shouldHide || !isInTimeRange(card);
           card.classList.toggle("is-hidden-by-user", shouldHide);
         });
+        updateTimeFilterCounts();
+        updateTimeFilterEmpty();
         newsCategoryPanels.forEach((panel) => {
           const visibleCards = Array.from(panel.querySelectorAll("[data-item-key]")).filter((card) => !card.hidden);
           const emptyState = panel.querySelector(".news-category-empty");
@@ -1009,11 +1073,14 @@ def render_dashboard() -> str:
         }
       });
 
+      timeFilterButtons.forEach((button) => {
+        button.addEventListener("click", () => setTimeFilter(Number(button.dataset.hours)));
+      });
+
       applyFontSize();
       renderViewed();
       pruneHiddenItemIds();
-      renderItemVisibility();
-      ensureActiveNewsCategory();
+      setTimeFilter(Number(readStoredValue(timeFilterStorageKey) || 0));
       refreshSlideshow();
       pollStatus();
     </script>
@@ -1026,7 +1093,7 @@ def render_dashboard() -> str:
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>Morning Market</title>
-    <link rel=\"stylesheet\" href=\"/static/styles.css?v=reader-6\" />
+    <link rel=\"stylesheet\" href=\"/static/styles.css?v=reader-7\" />
   </head>
   <body>
     <div class=\"app\">
@@ -1061,11 +1128,18 @@ def render_dashboard() -> str:
           <div class=\"panel-meta\">
             <p id=\"panel-description\">리포트·공시·뉴스를 시간순으로 보여줍니다.</p>
             <div class=\"panel-actions\">
+              <div class=\"time-filter\" role=\"group\" aria-label=\"기간 필터\">
+                <button type=\"button\" class=\"time-filter-button\" data-hours=\"1\" aria-pressed=\"false\">1시간</button>
+                <button type=\"button\" class=\"time-filter-button\" data-hours=\"2\" aria-pressed=\"false\">2시간</button>
+                <button type=\"button\" class=\"time-filter-button\" data-hours=\"6\" aria-pressed=\"false\">6시간</button>
+                <button type=\"button\" class=\"time-filter-button is-active\" data-hours=\"0\" aria-pressed=\"true\">전체</button>
+              </div>
               <button type=\"button\" class=\"read-all-button\" id=\"read-all\">모두 읽음</button>
               <button type=\"button\" class=\"slideshow-toggle-button\" id=\"slideshow-toggle\" aria-pressed=\"false\">슬라이드쇼</button>
             </div>
           </div>
           <div class=\"news-list\" id=\"news-list\">
+            <p class=\"time-filter-empty\" id=\"time-filter-empty\" hidden></p>
             <div class=\"tab-panel is-active\" id=\"all-panel\" role=\"tabpanel\" aria-labelledby=\"all-tab\">
               <div class=\"grid\">
                 {all_cards}
@@ -1148,6 +1222,21 @@ def format_published_label(item: dict[str, str]) -> str:
     if local.date() == datetime.now(KST).date():
         return f"{local:%H:%M}"
     return f"{local.month}/{local.day} {local:%H:%M}"
+
+
+def filter_timestamp_ms(item: dict[str, str]) -> int:
+    """Time the period filter (1h/2h/6h) compares against, as epoch milliseconds."""
+    moment = published_sort_value(item)
+    if moment.year < 1971:  # unparseable date
+        return 0
+    if not is_news(item) and moment.astimezone(KST).time() == dt_time(0):
+        # Reports and filings carry only a date, so use when they were first collected.
+        try:
+            collected = datetime.strptime(str(item.get("created_at") or ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            moment = max(moment, collected)
+        except ValueError:
+            pass
+    return int(moment.timestamp() * 1000)
 
 
 def sort_items_by_published_desc(items: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1520,6 +1609,7 @@ def render_card(item: dict[str, str], similar: list[dict[str, str]] | None = Non
     item_attrs = (
         f' data-item-id="{item_id}" data-item-key="{item_key}" data-item-read-keys="{item_keys}" data-item-kind="{item_kind}"'
         f' data-kind-label="{kind_label}" data-category="{html.escape(category)}" data-source="{source}" data-time="{time_label}"'
+        f' data-filter-ts="{filter_timestamp_ms(item)}"'
     )
     hide_button = """
         <button type="button" class="item-hide-button" aria-label="읽은 항목 숨기기">읽음</button>
