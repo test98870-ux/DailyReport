@@ -175,6 +175,22 @@ button:disabled { cursor: default; opacity: 0.4; }
 #panel-description { margin: 0; min-width: 0; font-size: 12px; color: var(--muted); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .panel-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
+.time-filter { display: flex; border: 1px solid var(--line-strong); border-radius: 7px; overflow: hidden; }
+.time-filter-button {
+  padding: 5px 9px;
+  border: 0;
+  border-left: 1px solid var(--line-strong);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+.time-filter-button:first-child { border-left: 0; }
+.time-filter-button:hover { background: var(--surface-muted); color: var(--text); }
+.time-filter-button.is-active { background: var(--text); color: var(--surface); }
+.time-filter-empty { margin: 0; padding: 28px 14px; text-align: center; font-size: 13px; color: var(--muted); }
+.time-filter-empty[hidden] { display: none; }
+
 .read-all-button,
 .slideshow-toggle-button,
 .category-read-button,

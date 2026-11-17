@@ -154,6 +154,17 @@ class MobileBackendTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 mobile.save_settings(json.dumps(invalid))
 
+    def test_hour_filter_time_is_first_collection_for_date_only_reports(self):
+        news = self.item()
+        report = self.item(title='날짜만 있는 리포트', url='https://stock.naver.com/research/company/456')
+        report.source_type = '증권사 리포트'
+        report.published_at = sources.date_only_published_at(datetime.now(sources.KST).date())
+        before = datetime.now(sources.KST) - timedelta(seconds=2)
+        items = {row['title']: row for row in self.collect(FakeSource([news, report]))['items']}
+        self.assertEqual(items[news.title]['filterAt'], news.published_at)
+        self.assertEqual(items[report.title]['published'], report.published_at)
+        self.assertGreaterEqual(datetime.fromisoformat(items[report.title]['filterAt']), before)
+
     def test_report_intro_is_stored_text_and_does_not_fetch_article_pages(self):
         report = self.item()
         report.source_type = '증권사 리포트'

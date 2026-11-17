@@ -154,6 +154,39 @@ class SourceTests(unittest.TestCase):
                 os.environ["OPENDART_API_KEY"] = "from-shell"
                 self.assertEqual(list(sources.build_sources())[0].api_key, "from-shell")
 
+    def test_daum_discovery_adds_only_sections_missing_from_the_config(self):
+        home = '''<a href="/news/home" class="link_gnb"><span class="txt_gnb">홈</span></a>
+          <a href="/news/economy" class="link_gnb"><span class="txt_gnb">경제</span></a>
+          <a href="/news/society" class="link_gnb"><span class="txt_gnb">사회</span></a>
+          <a href="/news/space" class="link_gnb"><span class="txt_gnb">우주</span></a>
+          <a class="link_tit" href="https://issue.daum.net/news/reportage"><span class="txt_box"> 현장/르포 </span></a>
+          <a class="link_tit" href="https://example.com/x"><span class="txt_box">외부</span></a>
+          <a href="/news/edit">서비스안내</a>'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sources.json"
+            path.write_text(json.dumps([
+                {"type": "daum_news_section", "name": "홈", "section_url": "https://news.daum.net/", "section_name": "홈"},
+                {"type": "daum_news_section", "name": "경제", "section_path": "news/economy", "section_name": "경제"},
+                {"type": "daum_news_section", "name": "사회", "section_path": "news/society", "section_name": "사회", "enabled": False},
+                {"type": "daum_news_discover", "name": "자동"},
+            ]), encoding="utf-8")
+            with patch("sources.load_env_file"), patch.object(sources, "DEFAULT_CONFIG_FILE", path):
+                with patch("sources.fetch_text", return_value=home):
+                    result = list(sources.build_sources())
+                with patch("sources.fetch_text", side_effect=OSError("차단")):
+                    failed = list(sources.build_sources())
+                with patch("sources.fetch_text", return_value="<html></html>"):
+                    changed = list(sources.build_sources())
+        self.assertEqual([s.name for s in result], ["홈", "경제", "다음 뉴스 우주", "다음 뉴스 현장/르포"])
+        self.assertEqual(result[2].section_url, "https://news.daum.net/news/space")
+        # A discovered page without article cards (e.g. script-rendered) is empty, not an error.
+        with patch("sources.fetch_text", return_value="<html></html>"):
+            self.assertEqual(result[3].fetch(), [])
+            with self.assertRaises(RuntimeError):
+                result[1].fetch()
+        self.assertIn("차단", failed[-1].skip_reason)
+        self.assertIn("메뉴를 찾지 못했습니다", changed[-1].skip_reason)
+
     def test_missing_key_is_visible_and_disabled_sources_are_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sources.json"

@@ -8,3 +8,4 @@ android/local.properties
 android/*.jks
 android/*.keystore
 artifacts/
+*.log

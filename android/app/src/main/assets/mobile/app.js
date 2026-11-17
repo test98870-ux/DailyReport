@@ -18,7 +18,7 @@
   const state = {
     items: [], tab: Object.hasOwn(titles, savedUi.tab) ? savedUi.tab : 'all',
     read: ['all', 'read', 'unread'].includes(savedUi.read) ? savedUi.read : 'all',
-    range: ['all', '1', '3', '7'].includes(savedUi.range) ? savedUi.range : 'all',
+    range: ['all', '1h', '2h', '6h'].includes(savedUi.range) ? savedUi.range : 'all',
     category: typeof savedUi.category === 'string' ? savedUi.category : '전체',
     query: typeof savedUi.query === 'string' ? savedUi.query : '',
     limit: Number.isSafeInteger(savedUi.limit) ? Math.max(40, Math.min(10000, savedUi.limit)) : 40,
@@ -130,11 +130,12 @@
     }
   }
   function baseItems() {
-    const cutoff = state.range === 'all' ? 0 : Date.now() - Number(state.range) * 86400000;
+    // Hour ranges compare against filterAt: publish time, or first collection for date-only reports and filings.
+    const cutoff = state.range === 'all' ? 0 : Date.now() - parseInt(state.range, 10) * 3600000;
     const query = state.query.trim().toLocaleLowerCase('ko-KR');
     return state.items.filter(item => (state.tab === 'all' || (state.tab === 'saved' ? item.starred : item.kind === state.tab))
       && (state.read === 'all' || (state.read === 'read' ? item.read : !item.read))
-      && (!cutoff || Date.parse(item.published) >= cutoff)
+      && (!cutoff || Date.parse(item.filterAt || item.published) >= cutoff)
       && (!query || (item.title + ' ' + item.source).toLocaleLowerCase('ko-KR').includes(query)));
   }
   function render() {
@@ -144,7 +145,7 @@
       else button.removeAttribute('aria-current');
     });
     document.querySelectorAll('[data-read]').forEach(button => button.setAttribute('aria-pressed', button.dataset.read === state.read));
-    $('range-filter').value = state.range;
+    document.querySelectorAll('[data-range]').forEach(button => button.setAttribute('aria-pressed', button.dataset.range === state.range));
     const base = baseItems();
     const categories = [...new Set(base.map(item => item.category))];
     if (state.loaded && !categories.includes(state.category)) state.category = '전체';
@@ -391,7 +392,7 @@
     $('cancel-collection').disabled = true; request('cancel').catch(error => toast(error.message));
   };
   $('search').oninput = event => { state.query = event.target.value; state.limit = 40; render(); };
-  $('range-filter').onchange = event => { state.range = event.target.value; state.limit = 40; render(); };
+  $('range-filters').onclick = event => { const button = event.target.closest('[data-range]'); if (!button) return; state.range = button.dataset.range; state.limit = 40; render(); };
   $('read-filters').onclick = event => { const button = event.target.closest('[data-read]'); if (!button) return; state.read = button.dataset.read; state.limit = 40; render(); };
   $('bottom-nav').onclick = event => {
     const button = event.target.closest('[data-tab]'); if (!button) return;
